@@ -6,16 +6,16 @@
 
 #### Linux (amd64)
 ```bash
-GOOS=linux GOARCH=amd64 go build -o pre-cache main.go
+GOOS=linux GOARCH=amd64 go build -o pre-caching main.go
 ```
 
 ### 运行示例
 ```bash
 # 基本使用
-./pre-cache -sitemap="https://yoursite.com/sitemap.xml"
+./pre-caching -sitemap="https://yoursite.com/sitemap.xml"
 
 # 指定更多参数
-./pre-cache -sitemap="https://yoursite.com/sitemap.xml" \
+./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
            -size=5 \
            -timeout=15 \
            -cacheheader="x-cache" \
@@ -23,7 +23,7 @@ GOOS=linux GOARCH=amd64 go build -o pre-cache main.go
            -debug
 
 # 显示帮助
-./pre-cache -h
+./pre-caching -h
 ```
 
 ## 参数说明
