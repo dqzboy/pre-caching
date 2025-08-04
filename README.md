@@ -4,10 +4,6 @@
 
 ## 编译和运行
 
-- Go语言支持交叉编译，可以在一个平台上编译出其他平台的可执行文件。
-
-### 手动跨平台编译
-
 #### Linux (amd64)
 ```bash
 GOOS=linux GOARCH=amd64 go build -o pre-cache main.go
