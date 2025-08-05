@@ -29,7 +29,7 @@ GOOS=linux GOARCH=amd64 go build -o pre-caching main.go
 ## 参数说明
 
 - `-sitemap`: 网站地图sitemap地址 (必需)
-- `-size`: 并发请求数量，默认10 (建议比Python版本设置更小的值)
+- `-size`: 并发请求数量，默认10
 - `-timeout`: 单个请求的超时时间，默认10秒
 - `-host`: 指定真实主机，比如 127.0.0.1:8080
 - `-cacheheader`: 缓存标识头，比如: x-cache
