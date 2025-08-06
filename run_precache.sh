@@ -58,11 +58,4 @@ echo "========================================="
 echo "预缓存任务完成"
 echo "退出码: $EXIT_CODE"
 
-# 如果有日志文件，显示日志文件位置
-if [ -f "pre-cache.log" ]; then
-    echo "日志文件: $SCRIPT_DIR/pre-cache.log"
-    echo "最后10行日志:"
-    tail -10 pre-cache.log
-fi
-
 exit $EXIT_CODE
