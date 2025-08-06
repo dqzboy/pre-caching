@@ -1,0 +1,35 @@
+# 预缓存定时任务配置示例
+# 
+# 使用方法：
+# 1. 编辑此文件，修改路径和时间
+# 2. 执行命令安装定时任务：crontab crontab_example.txt
+# 3. 查看定时任务：crontab -l
+# 4. 删除定时任务：crontab -r
+#
+# 时间格式说明：
+# * * * * * 命令
+# | | | | |
+# | | | | +-- 星期几 (0-7, 0和7都表示星期日)
+# | | | +---- 月份 (1-12)
+# | | +------ 日期 (1-31)
+# | +-------- 小时 (0-23)
+# +---------- 分钟 (0-59)
+
+# 请修改以下路径为您的实际路径
+SHELL=/bin/bash
+PATH=/usr/local/bin:/usr/bin:/bin
+
+# 示例1: 每天凌晨2点执行预缓存
+0 2 * * * run_precache.sh >> pre-caching/cron.log 2>&1
+
+# 示例2: 每6小时执行一次（0点、6点、12点、18点）
+# 0 */6 * * * run_precache.sh >> pre-caching/cron.log 2>&1
+
+# 示例3: 每天早上8点和晚上8点执行
+# 0 8,20 * * * pre-caching/run_precache.sh >> pre-caching/cron.log 2>&1
+
+# 示例4: 工作日每2小时执行一次
+# 0 */2 * * 1-5 pre-caching/run_precache.sh >> pre-caching/cron.log 2>&1
+
+# 示例5: 每周日凌晨3点执行
+# 0 3 * * 0 pre-caching/run_precache.sh >> pre-caching/cron.log 2>&1

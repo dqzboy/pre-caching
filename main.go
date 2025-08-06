@@ -7,6 +7,8 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -14,31 +16,55 @@ import (
 )
 
 // Colors 用于输出彩色文本
-type Colors struct{}
+type Colors struct {
+	logFile *os.File
+}
+
+func (c *Colors) log(msg string) {
+	if c.logFile != nil {
+		c.logFile.WriteString(msg + "\n")
+	}
+}
 
 func (c *Colors) Normal(msg string) {
 	fmt.Println(msg)
+	c.log(msg)
 }
 
 func (c *Colors) Green(msg string) {
-	fmt.Printf("\033[32m%s\033[0m\n", msg)
+	colorMsg := fmt.Sprintf("\033[32m%s\033[0m", msg)
+	fmt.Println(colorMsg)
+	c.log(msg)
 }
 
 func (c *Colors) Yellow(msg string) {
-	fmt.Printf("\033[33m%s\033[0m\n", msg)
+	colorMsg := fmt.Sprintf("\033[33m%s\033[0m", msg)
+	fmt.Println(colorMsg)
+	c.log(msg)
 }
 
 func (c *Colors) Red(msg string) {
-	fmt.Printf("\033[31m%s\033[0m\n", msg)
+	colorMsg := fmt.Sprintf("\033[31m%s\033[0m", msg)
+	fmt.Println(colorMsg)
+	c.log(msg)
 }
 
 func (c *Colors) Blue(msg string) {
-	fmt.Printf("\033[34m%s\033[0m\n", msg)
+	colorMsg := fmt.Sprintf("\033[34m%s\033[0m", msg)
+	fmt.Println(colorMsg)
+	c.log(msg)
+}
+
+func (c *Colors) Cyan(msg string) {
+	colorMsg := fmt.Sprintf("\033[36m%s\033[0m", msg)
+	fmt.Println(colorMsg)
+	c.log(msg)
 }
 
 func (c *Colors) Debug(msg string, debug bool) {
 	if debug {
 		fmt.Println(msg)
+		c.log(msg)
 	}
 }
 
@@ -76,6 +102,7 @@ type PreCache struct {
 	scheme      string
 	domain      string
 	startTime   time.Time
+	logFile     *os.File
 
 	// 统计信息
 	hitCount       int
@@ -93,7 +120,20 @@ func NewPreCache(sitemap, host, cacheHeader, userAgent string, size int, timeout
 	}
 
 	if userAgent == "" {
-		userAgent = "Pre-cache/go-http-client/1.0"
+		userAgent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+	}
+
+	// 创建日志文件
+	execPath, err := os.Executable()
+	if err != nil {
+		return nil, fmt.Errorf("获取执行文件路径失败：%v", err)
+	}
+	execDir := filepath.Dir(execPath)
+	logPath := filepath.Join(execDir, "pre-cache.log")
+
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
+	if err != nil {
+		return nil, fmt.Errorf("创建日志文件失败：%v", err)
 	}
 
 	client := &http.Client{
@@ -104,6 +144,8 @@ func NewPreCache(sitemap, host, cacheHeader, userAgent string, size int, timeout
 			IdleConnTimeout:     30 * time.Second,
 		},
 	}
+
+	report := &Colors{logFile: logFile}
 
 	return &PreCache{
 		sitemapURL:  sitemap,
@@ -116,10 +158,11 @@ func NewPreCache(sitemap, host, cacheHeader, userAgent string, size int, timeout
 		verify:      verify,
 		debug:       debug,
 		client:      client,
-		report:      &Colors{},
+		report:      report,
 		scheme:      parsedURL.Scheme,
 		domain:      parsedURL.Host,
 		startTime:   time.Now(),
+		logFile:     logFile,
 	}, nil
 }
 
@@ -302,6 +345,7 @@ func (pc *PreCache) processResults(results []RequestResult) {
 
 // Start 启动预缓存
 func (pc *PreCache) Start() error {
+	pc.report.Cyan(fmt.Sprintf("执行开始时间：%s", pc.startTime.Format("2006-01-02 15:04:05")))
 	pc.report.Normal(fmt.Sprintf("站点地图：%s", pc.sitemapURL))
 
 	if pc.host != "" {
@@ -408,9 +452,11 @@ func (pc *PreCache) processURLsSequentially(urls []string) []RequestResult {
 } // printStatistics 打印统计信息
 func (pc *PreCache) printStatistics(totalCount int) {
 	elapsed := time.Since(pc.startTime)
+	endTime := time.Now()
 
 	pc.report.Normal("---------------------------------------------------------")
 	pc.report.Blue(fmt.Sprintf("预缓存完成，页面总数：%d，耗时%d秒", totalCount, int(elapsed.Seconds())))
+	pc.report.Cyan(fmt.Sprintf("执行结束时间：%s", endTime.Format("2006-01-02 15:04:05")))
 
 	if pc.hitCount > 0 {
 		pc.report.Green(fmt.Sprintf("已被缓存页面数：%d", pc.hitCount))
@@ -432,6 +478,19 @@ func (pc *PreCache) printStatistics(totalCount int) {
 		pc.report.Yellow(fmt.Sprintf("缓存标识头缺失页面数：%d", pc.noHeaderCount))
 	}
 
+	// 计算缓存命中率和预缓存效果
+	if pc.cacheHeader != "" && (pc.hitCount+pc.missCount) > 0 {
+		totalCacheable := pc.hitCount + pc.missCount
+		hitRate := float64(pc.hitCount) / float64(totalCacheable) * 100
+		pc.report.Normal("---------------------------------------------------------")
+		pc.report.Green(fmt.Sprintf("缓存命中率：%.1f%% (%d/%d)", hitRate, pc.hitCount, totalCacheable))
+
+		if pc.missCount > 0 {
+			pc.report.Blue(fmt.Sprintf("预缓存效果：本次访问触发了 %d 个页面的缓存生成", pc.missCount))
+			pc.report.Yellow("建议：等待几分钟后再次运行此工具，验证缓存是否生效")
+		}
+	}
+
 	if pc.hitCount+pc.missCount == 0 {
 		if pc.cacheHeader != "" {
 			pc.report.Yellow(fmt.Sprintf("指定的缓存标识头 %s 可能不对，未能找到这个头信息.", pc.cacheHeader))
@@ -449,7 +508,7 @@ func main() {
 		delay       = flag.Int("delay", 500, "请求间延迟(毫秒),默认500ms")
 		host        = flag.String("host", "", "指定真实主机，比如 127.0.0.1:8080")
 		cacheHeader = flag.String("cacheheader", "", "缓存标识，比如: x-cache")
-		userAgent   = flag.String("useragent", "", "指定UA标识，默认 Pre-cache/go-http-client/1.0")
+		userAgent   = flag.String("useragent", "", "指定UA标识，默认 Chrome 120 UA")
 		verify      = flag.Bool("verify", false, "是否校验SSL，默认不校验")
 		debug       = flag.Bool("debug", false, "显示Debug信息, 默认关闭")
 	)
@@ -466,6 +525,13 @@ func main() {
 		fmt.Printf("初始化失败: %v\n", err)
 		return
 	}
+
+	// 确保日志文件关闭
+	defer func() {
+		if preCache.logFile != nil {
+			preCache.logFile.Close()
+		}
+	}()
 
 	if err := preCache.Start(); err != nil {
 		fmt.Printf("执行失败: %v\n", err)
