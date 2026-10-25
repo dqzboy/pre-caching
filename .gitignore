@@ -1,18 +1,14 @@
-# Build and Release Folders
-bin-debug/
-bin-release/
-[Oo]bj/
-[Bb]in/
+.work*
+.DS_Store
 
-# Other files and folders
-.settings/
+*.log
+*.log.1
+.precache.lock
+.precache.lock.d
 
-# Executables
-*.swf
-*.air
-*.ipa
-*.apk
+precache.env
 
-# Project files, i.e. `.project`, `.actionScriptProperties` and `.flexProperties`
-# should NOT be excluded as they contain compiler settings and other important
-# information for Eclipse / Flash Builder.
+pre-caching-amd64
+pre-caching-arm64
+/pre-caching
+dist/
