@@ -1,13 +1,19 @@
 package main
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
+	"fmt"
+	"math"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -285,10 +291,516 @@ func TestStartObservesThenExcludesConfirmedPage(t *testing.T) {
 	if code, err := next.Start(context.Background()); err != nil || code != 0 {
 		t.Fatalf("next run: code %d, err %v", code, err)
 	}
-	if got := strings.Join(next.cfg.Exclude, "\n"); !strings.Contains(got, u) {
+	if got := strings.Join(next.loadLearned(), "\n"); !strings.Contains(got, u) {
 		t.Fatalf("confirmed page was not loaded for exclusion: %q", got)
 	}
 	if got := slowRequests.Load(); got != 2 {
 		t.Fatalf("confirmed page was requested again: got %d requests, want 2", got)
+	}
+}
+
+func newTestCache(t *testing.T, cfg Config) *PreCache {
+	t.Helper()
+	cfg.NoLearn = true
+	if cfg.Timeout == 0 {
+		cfg.Timeout = time.Second
+	}
+	if cfg.Concurrency == 0 {
+		cfg.Concurrency = 1
+	}
+	pc, err := NewPreCache(cfg, &Printer{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pc.transport.CloseIdleConnections)
+	return pc
+}
+func TestResponseBodyTimeout(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Cache", "HIT")
+		w.WriteHeader(200)
+		w.(http.Flusher).Flush()
+		<-r.Context().Done()
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", CacheHeader: "X-Cache", Timeout: 50 * time.Millisecond})
+	r, _ := pc.once(context.Background(), Page{RawURL: s.URL, URL: s.URL}, http.MethodGet)
+	if !r.Timeout || r.Class != ClassException {
+		t.Fatalf("body timed out but class=%v status=%d timeout=%v err=%q", r.Class, r.Status, r.Timeout, r.Err)
+	}
+}
+func TestIncompleteSitemapFailsRun(t *testing.T) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			fmt.Fprintf(w, "<sitemapindex><sitemap><loc>%s/good.xml</loc></sitemap><sitemap><loc>%s/bad.xml</loc></sitemap></sitemapindex>", s.URL, s.URL)
+		case "/good.xml":
+			fmt.Fprintf(w, "<urlset><url><loc>%s/page</loc></url></urlset>", s.URL)
+		case "/bad.xml":
+			w.WriteHeader(503)
+		default:
+			w.Header().Set("X-Cache", "HIT")
+			w.WriteHeader(200)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", CacheHeader: "X-Cache"})
+	code, err := pc.Start(context.Background())
+	if code == 0 && err == nil {
+		t.Fatal("one of two child sitemaps failed with 503 but Start returned code=0, err=nil")
+	}
+}
+func TestRetriesRespectRate(t *testing.T) {
+	var mu sync.Mutex
+	var stamps []time.Time
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		stamps = append(stamps, time.Now())
+		n := len(stamps)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(503)
+		} else {
+			w.WriteHeader(200)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", Rate: 1, Retries: 1})
+	pc.run(context.Background(), []Page{{RawURL: s.URL, URL: s.URL}})
+	mu.Lock()
+	defer mu.Unlock()
+	gap := stamps[1].Sub(stamps[0])
+	if gap < 900*time.Millisecond {
+		t.Fatalf("rate=1 but retry request gap=%v", gap)
+	}
+}
+func TestRecheckIncludesFailures(t *testing.T) {
+	var a, b atomic.Int32
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			fmt.Fprintf(w, "<urlset><url><loc>%s/a</loc></url><url><loc>%s/b</loc></url></urlset>", s.URL, s.URL)
+		case "/a":
+			if a.Add(1) == 1 {
+				w.Header().Set("X-Cache", "MISS")
+			} else {
+				w.Header().Set("X-Cache", "HIT")
+			}
+		case "/b":
+			if b.Add(1) == 1 {
+				w.Header().Set("X-Cache", "MISS")
+			} else {
+				w.WriteHeader(503)
+			}
+		default:
+			w.WriteHeader(200)
+		}
+	}))
+	defer s.Close()
+	report := filepath.Join(t.TempDir(), "report.json")
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", CacheHeader: "X-Cache", Recheck: time.Millisecond, JSONPath: report, MaxErrRate: 1})
+	code, err := pc.Start(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep jsonReport
+	if err = json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.Recheck.HitRate != 50 || code == 0 {
+		t.Fatalf("recheck: 1 HIT + 1 HTTP503, report=%+v, first-pass error_rate=%v exit=%d", rep.Recheck, rep.ErrorRate, code)
+	}
+}
+func TestIncrementalNoChanges(t *testing.T) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sitemap.xml" {
+			fmt.Fprintf(w, "<urlset><url><loc>%s/old</loc><lastmod>2020-01-01</lastmod></url></urlset>", s.URL)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", LastMod: time.Hour})
+	code, err := pc.Start(context.Background())
+	if code != 0 || err != nil {
+		t.Fatalf("valid sitemap, zero recently changed pages: exit=%d err=%v", code, err)
+	}
+}
+func TestLearnedURLMatchesExactly(t *testing.T) {
+	var n atomic.Int32
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sitemap.xml" {
+			fmt.Fprintf(w, "<urlset><url><loc>%s/post/1</loc></url><url><loc>%s/post/10</loc></url></urlset>", s.URL, s.URL)
+		} else if strings.HasPrefix(r.URL.Path, "/post/") {
+			n.Add(1)
+		}
+	}))
+	defer s.Close()
+	path := filepath.Join(t.TempDir(), "slow.txt")
+	if err := os.WriteFile(path, []byte(s.URL+"/post/1\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", LearnPath: path})
+	pc.cfg.NoLearn = false
+	code, err := pc.Start(context.Background())
+	if err != nil || code != 0 {
+		t.Fatal(code, err)
+	}
+	if got := n.Load(); got != 1 {
+		t.Fatalf("learned /post/1 also excludes /post/10, executed requests=%d", got)
+	}
+}
+func TestReportWriteFailureIsFatal(t *testing.T) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sitemap.xml" {
+			fmt.Fprintf(w, "<urlset><url><loc>%s/page</loc></url></urlset>", s.URL)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", JSONPath: filepath.Join(t.TempDir(), "missing", "report.json")})
+	code, err := pc.Start(context.Background())
+	if code == 0 && err == nil {
+		t.Fatal("required JSON report cannot be written but exit=0, err=nil")
+	}
+}
+func TestRetryAfterHonored(t *testing.T) {
+	got := backoff(1, 120*time.Second)
+	if got < 120*time.Second {
+		t.Fatalf("Retry-After=120s shortened to %v", got)
+	}
+}
+func TestHealthRejects429(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { w.Header().Set("Retry-After", "120"); w.WriteHeader(429) }))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml"})
+	if err := pc.healthCheck(context.Background()); err == nil {
+		t.Fatal("HTTP429 is marked healthy")
+	}
+}
+func TestServerErrorRate(t *testing.T) {
+	stats := summarize([]Result{{Status: 403, Class: ClassHTTPError}, {Status: 200, Class: ClassHit}})
+	if rate := stats.errRate(); rate != 0 {
+		t.Fatalf("documented server-unavailable metric counts HTTP403, rate=%v%%", rate)
+	}
+}
+func TestCircuitCountsEachAttempt(t *testing.T) {
+	var requests atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { requests.Add(1); w.WriteHeader(503) }))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", MaxFail: 1, Retries: 2})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	pc.cancel = cancel
+	pc.run(ctx, []Page{{RawURL: s.URL, URL: s.URL}})
+	if n := requests.Load(); n != 1 {
+		t.Fatalf("max-fail=1 retry=2, requests before trip=%d", n)
+	}
+}
+
+func TestSlowThresholdAndTopK(t *testing.T) {
+	pc := newTestCache(t, Config{Sitemap: "https://example.com/sitemap.xml"})
+	if pc.cfg.SlowThreshold != 2*time.Second {
+		t.Fatalf("default threshold: %v", pc.cfg.SlowThreshold)
+	}
+	results := []Result{
+		{Page: Page{RawURL: "boundary"}, Class: ClassHit, Elapsed: 2 * time.Second},
+		{Page: Page{RawURL: "normal"}, Class: ClassHit, Elapsed: 600 * time.Millisecond},
+		{Page: Page{RawURL: "timeout"}, Class: ClassException, Timeout: true, Elapsed: 100 * time.Millisecond},
+		{Page: Page{RawURL: "skipped"}, Class: ClassSkipped, Elapsed: time.Hour},
+	}
+	for i := 3; i < 20; i++ {
+		results = append(results, Result{Page: Page{RawURL: fmt.Sprint(i)}, Class: ClassHit, Elapsed: time.Duration(i) * time.Second})
+	}
+	top := pc.slowest(results, 5)
+	if len(top) != 5 || top[0].Elapsed != 19*time.Second || top[4].Elapsed != 15*time.Second {
+		t.Fatalf("unexpected top 5: %+v", top)
+	}
+	if results[0].Page.RawURL != "boundary" {
+		t.Fatal("input was reordered")
+	}
+	pc.cfg.SlowThreshold = 30 * time.Second
+	top = pc.slowest(results, 10)
+	if len(top) != 1 || top[0].Page.RawURL != "timeout" {
+		t.Fatalf("timeouts must remain visible above threshold: %+v", top)
+	}
+	pc.cfg.SlowThreshold = 500 * time.Millisecond
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := pc.writeJSON(path, results[:2], summarize(results[:2]), time.Second, nil, 0); err != nil {
+		t.Fatal(err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report jsonReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.SlowThresholdSec != 0.5 || len(report.Slowest) != 2 {
+		t.Fatalf("JSON ignored threshold: %+v", report)
+	}
+}
+
+func TestLargeBodyDrainedAndConnectionReused(t *testing.T) {
+	var connections atomic.Int32
+	s := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Cache", "HIT")
+		_, _ = w.Write(bytes.Repeat([]byte("x"), 1024*1024))
+	}))
+	s.Config.ConnState = func(_ net.Conn, state http.ConnState) {
+		if state == http.StateNew {
+			connections.Add(1)
+		}
+	}
+	s.Start()
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", CacheHeader: "X-Cache"})
+	for i := 0; i < 2; i++ {
+		r, _ := pc.once(context.Background(), Page{RawURL: s.URL, URL: s.URL}, http.MethodGet)
+		if r.Class != ClassHit {
+			t.Fatalf("large response failed: %+v", r)
+		}
+	}
+	if got := connections.Load(); got != 1 {
+		t.Fatalf("connection not reused for >512KiB response: %d connections", got)
+	}
+}
+
+func TestSitemapGzipVariants(t *testing.T) {
+	for _, mode := range []string{"file", "encoding", "transparent", "corrupt"} {
+		t.Run(mode, func(t *testing.T) {
+			data := []byte("<urlset><url><loc>https://example.com/page</loc></url></urlset>")
+			var compressed bytes.Buffer
+			gz := gzip.NewWriter(&compressed)
+			_, _ = gz.Write(data)
+			if err := gz.Close(); err != nil {
+				t.Fatal(err)
+			}
+			s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if mode == "transparent" {
+					_, _ = w.Write(data)
+					return
+				}
+				if mode == "encoding" {
+					w.Header().Set("Content-Encoding", "gzip")
+				}
+				body := compressed.Bytes()
+				if mode == "corrupt" {
+					body = body[:len(body)-5]
+				}
+				_, _ = w.Write(body)
+			}))
+			defer s.Close()
+			target := s.URL + "/sitemap.xml.gz?token=1"
+			pc := newTestCache(t, Config{Sitemap: target})
+			got, err := pc.getBytes(context.Background(), target)
+			if mode == "corrupt" {
+				if err == nil {
+					t.Fatal("corrupt gzip accepted")
+				}
+				return
+			}
+			if err != nil || !bytes.Equal(got, data) {
+				t.Fatalf("getBytes: %q, %v", got, err)
+			}
+		})
+	}
+}
+
+func TestRedirectsRespectRate(t *testing.T) {
+	var mu sync.Mutex
+	var times []time.Time
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		times = append(times, time.Now())
+		mu.Unlock()
+		if r.URL.Path == "/from" {
+			http.Redirect(w, r, "/to", http.StatusFound)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", Rate: 5})
+	r, _ := pc.once(context.Background(), Page{RawURL: s.URL + "/from", URL: s.URL + "/from"}, http.MethodGet)
+	if r.Status != 200 {
+		t.Fatalf("redirect failed: %+v", r)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(times) != 2 || times[1].Sub(times[0]) < 180*time.Millisecond {
+		t.Fatalf("redirect bypassed limiter: %v", times)
+	}
+}
+
+func TestCancellationIsSkippedAndReported(t *testing.T) {
+	started := make(chan struct{})
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			fmt.Fprintf(w, "<urlset><url><loc>%s/slow</loc></url></urlset>", s.URL)
+		case "/slow":
+			w.WriteHeader(200)
+			w.(http.Flusher).Flush()
+			close(started)
+			<-r.Context().Done()
+		}
+	}))
+	defer s.Close()
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", JSONPath: reportPath, MaxFail: 1, MaxErrRate: 1})
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	done := make(chan int, 1)
+	go func() { code, _ := pc.Start(ctx); done <- code }()
+	select {
+	case <-started:
+		cancel()
+	case <-ctx.Done():
+		t.Fatal("request did not start")
+	}
+	if code := <-done; code != 130 {
+		t.Fatalf("cancellation exit=%d, want 130", code)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report jsonReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	if report.Counts["exception"] != 0 || report.Counts["skipped"] != 1 || report.Completed != 0 || report.ExitCode != 130 {
+		t.Fatalf("cancelled request reported as failure: %+v", report)
+	}
+}
+
+func TestNoMissDoesNotWaitForRecheck(t *testing.T) {
+	var s *httptest.Server
+	s = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/sitemap.xml" {
+			fmt.Fprintf(w, "<urlset><url><loc>%s/page</loc></url></urlset>", s.URL)
+		} else {
+			w.Header().Set("X-Cache", "HIT")
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", CacheHeader: "X-Cache", Recheck: time.Hour})
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if code, err := pc.Start(ctx); code != 0 || err != nil {
+		t.Fatalf("unnecessary recheck wait: code=%d err=%v", code, err)
+	}
+}
+
+func TestInvalidNumericConfiguration(t *testing.T) {
+	for _, cfg := range []Config{
+		{Rate: math.NaN()}, {Rate: math.Inf(1)}, {Rate: -1}, {Rate: 1e-100},
+		{SlowRatio: math.NaN()}, {MaxErrRate: 101}, {SlowThreshold: -time.Second},
+	} {
+		cfg.Sitemap = "https://example.com/sitemap.xml"
+		if _, err := NewPreCache(cfg, &Printer{}); err == nil {
+			t.Fatalf("invalid config accepted: %+v", cfg)
+		}
+	}
+	for _, n := range []int{7, 63, 10000} {
+		if d := backoff(n, 0); d < 10*time.Second || d > 15*time.Second {
+			t.Fatalf("overflowed backoff for attempt %d: %v", n, d)
+		}
+	}
+	if got := parseRetryAfter("9223372036854775807"); got <= 0 {
+		t.Fatalf("Retry-After overflow: %v", got)
+	}
+}
+
+func TestIncrementalKeepsUnknownDatesWithWarning(t *testing.T) {
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		fmt.Fprint(w, `<urlset><url><loc>https://example.com/old</loc><lastmod>2020-01-01</lastmod></url><url><loc>https://example.com/unknown</loc></url></urlset>`)
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", LastMod: time.Hour})
+	logFile, err := os.CreateTemp(t.TempDir(), "incremental-log-*")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer logFile.Close()
+	pc.out.file = logFile
+	pages, err := pc.loadPages(context.Background())
+	if err != nil || len(pages) != 1 || pages[0].RawURL != "https://example.com/unknown" {
+		t.Fatalf("incremental selection: %v, %v", pages, err)
+	}
+	logData, err := os.ReadFile(logFile.Name())
+	if err != nil || !strings.Contains(string(logData), "增量可能退化为全量") {
+		t.Fatalf("missing lastmod warning: %q, %v", logData, err)
+	}
+}
+
+func TestAtomicReportPreservesPermissions(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, []byte("old"), 0640); err != nil {
+		t.Fatal(err)
+	}
+	if err := writeAtomic(path, []byte(`{"completed":1}`)); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(path)
+	if err != nil || info.Mode().Perm() != 0640 {
+		t.Fatalf("report permissions changed: %v, %v", info, err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != `{"completed":1}` {
+		t.Fatalf("report replacement failed: %q, %v", data, err)
+	}
+}
+
+func TestErrorRateExcludesSkippedAndNonServerErrors(t *testing.T) {
+	s := summarize([]Result{
+		{Status: 451, Class: ClassHTTPError}, {Status: 403, Class: ClassHTTPError},
+		{Status: 404, Class: ClassNotFound}, {Status: 429, Class: ClassHTTPError},
+		{Status: 503, Class: ClassHTTPError}, {Class: ClassException, Timeout: true},
+		{Class: ClassSkipped},
+	})
+	if got := s.errRate(); got != 50 {
+		t.Fatalf("server error rate=%v, want 3/6=50%%", got)
+	}
+}
+
+func TestConcurrencyAndAdaptiveCap(t *testing.T) {
+	var active, peak atomic.Int32
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := active.Add(1)
+		defer active.Add(-1)
+		for old := peak.Load(); n > old; old = peak.Load() {
+			if peak.CompareAndSwap(old, n) {
+				break
+			}
+		}
+		time.Sleep(time.Millisecond)
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", Concurrency: 3})
+	pages := make([]Page, 20)
+	for i := range pages {
+		pages[i] = Page{RawURL: s.URL, URL: s.URL}
+	}
+	results := pc.run(context.Background(), pages)
+	if peak.Load() > 3 || summarize(results).Skipped != 0 {
+		t.Fatalf("worker cap failed: peak=%d stats=%+v", peak.Load(), summarize(results))
+	}
+	th := newThrottle(4, 2, &Printer{})
+	for i := 0; i < 10; i++ {
+		th.observe(50 * time.Millisecond)
+	}
+	for i := 0; i < 20; i++ {
+		th.observe(300 * time.Millisecond)
+	}
+	if th.limitNow() != 2 {
+		t.Fatalf("adaptive cap not reduced: %d", th.limitNow())
 	}
 }

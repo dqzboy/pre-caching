@@ -12,3 +12,6 @@ pre-caching-amd64
 pre-caching-arm64
 /pre-caching
 dist/
+
+# graft's local graph cache — regenerable, not committed (run `graft build`).
+graft/

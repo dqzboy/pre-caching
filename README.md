@@ -1,6 +1,6 @@
 ## 介绍
 
-用 Go 编写的网站预缓存工具，用于 CDN 预热、缓存状态检测和预热效果验证。
+用 Go 编写的网站预缓存工具，用于 CDN 预热、缓存状态检测和预热效果验证。部署环境为 **Linux amd64 / arm64**。
 
 ## 项目功能
 
@@ -14,14 +14,14 @@
 ### 技术特点
 - **连接复用**：完整读取响应体，keep-alive 连接会被复用，不再每个页面重新握手
 - **固定 worker 池**：并发数固定，不会因 URL 数量膨胀而创建海量 goroutine
-- **全局限速**：`-rate` 精确控制整体 QPS（默认 5），比调大/调小并发更可控
-- **过载熔断**：连续 N 个请求失败（5xx / 429 / 超时）自动中止，避免把已经扛不住的源站踩死
+- **全局限速**：`-rate` 控制实际 HTTP 请求的整体 QPS（默认 2），健康检查、sitemap、重试和重定向均计入配额
+- **过载熔断**：连续 N 次请求尝试失败（5xx / 429 / 网络异常）自动中止，重试也计数，避免把已经扛不住的源站踩死
 - **自适应降速**：源站响应变慢时自动收窄并发（最低降到 1），覆盖"站还能访问、只是越来越卡"这种熔断管不到的情况
-- **毒页面自动学习**：同一链接连续 3 个自然日超时才记入 `slow-pages.txt`，下次运行自动排除，避免偶发慢请求被误判
+- **毒页面自动学习**：同一链接连续 3 个自然日超时才记入 `slow-pages.txt`，下次运行按完整 URL 精确排除，避免偶发慢请求和相似路径被误伤
 - **预热前健康检查**：开工前先探一次源站，已故障或响应过慢就直接退出，不往故障上压请求
 - **慢页面报告**：统计里直接列出最慢的页面 Top 5（并写入 JSON），毒页面一眼可见，不用翻日志猜
 - **灰度试跑**：`-limit=N` 只跑前 N 个页面，先观察源站负载再放开全量
-- **失败重试**：对 429 / 408 / 502 / 503 / 504 及网络错误做指数退避重试，并遵循 `Retry-After`；**超时不重试**——等满整个超时周期仍无响应说明页面极重或源站过载，重试只会白占 PHP 进程
+- **失败重试**：对 429 / 408 / 502 / 503 / 504 及网络错误做指数退避重试，并完整遵循 `Retry-After`（不会把服务端要求的长等待截短）；**超时不重试**——等满整个超时周期仍无响应说明页面极重或源站过载，重试只会白占 PHP 进程
 - **sitemap 索引**：支持 `<sitemapindex>` 递归展开（最多 3 层）与 `.gz` 压缩包
 - **优雅中断**：Ctrl+C / SIGTERM 会停止派发并输出已完成部分的结果
 - **可观测**：状态码分布、失败明细、命中率、吞吐、退出码语义
@@ -37,7 +37,7 @@
 ### 2. 并发请求处理
 - 固定 `-size` 个 worker 消费任务队列，结果按索引写回，顺序稳定
 - 每个 worker 在两次请求之间保持 `-delay` 间隔，该等待不占用全局并发资源
-- 可选 `-rate` 作为全局 QPS 上限，所有 worker 共享同一个令牌间隔
+- 可选 `-rate` 作为全局 QPS 上限，所有 worker、重试和重定向共享同一个令牌间隔
 
 ### 3. 缓存状态判定
 按 HTTP 状态码优先分级，再看缓存头：
@@ -74,12 +74,12 @@ GOOS=linux GOARCH=arm64 go build -o pre-caching-arm64 main.go
 
 ```bash
 ./release.sh
-# 版本: 2.1.0
+# 版本: 2.6.0
 #   dist/pre-caching-amd64   6.3M
 #   dist/pre-caching-arm64   5.8M
 ```
 
-`release.sh` 会先跑 `gofmt -l` 和 `go vet`，不通过就中断；版本号从 `main.go` 的 `const version` 读取；编译带 `-trimpath`，同样代码在任何人机器上产出的二进制一致。
+`release.sh` 会先检查 Go 格式，执行 `go vet`、`go test -race` 和脚本回归测试，不通过就中断；版本号从 `main.go` 的 `const version` 读取；编译带 `-trimpath`，减少本地路径对产物的影响；精确复现产物还需要一致的 Go 版本、目标平台和构建参数。
 
 `run_precache.sh` 会按架构自动在 `./` 和 `./dist/` 两个位置查找二进制，所以本地直接跑也行。
 
@@ -111,7 +111,7 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 
 > **二进制和脚本必须一起更新**，否则会出现"脚本传了新参数、二进制不认识"的情况：
 > `flag provided but not defined: -retry`。
-> `run_precache.sh` 会做版本自检，二进制过旧时直接给出明确提示，不会静默失败。
+> `run_precache.sh` 会做版本自检，二进制低于 v2.6.0 时直接给出明确提示，不会等到传入新参数后才失败。
 
 ## 使用示例
 
@@ -152,11 +152,12 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `-sitemap` | 必填 | sitemap 地址，支持 `<urlset>` 与 `<sitemapindex>` |
-| `-size` | 5 | 并发 worker 数量（上限 512） |
-| `-delay` | 500 | 每个 worker 两次请求之间的间隔（毫秒） |
-| `-rate` | 5 | 全局 QPS 上限，**0 表示完全不限制**（不建议） |
-| `-max-fail` | 20 | 连续多少个请求失败后熔断中止，0 关闭熔断 |
+| `-size` | 1 | 并发 worker 数量（上限 512） |
+| `-delay` | 0 | 每个 worker 两次请求之间的额外间隔（毫秒）；默认由全局 `-rate` 控制节奏 |
+| `-rate` | 2 | 全局 QPS 上限，**0 表示完全不限制**（不建议） |
+| `-max-fail` | 20 | 连续多少次 HTTP 请求尝试失败后熔断中止，重试计数；0 关闭熔断 |
 | `-slow-ratio` | 3 | 平均耗时超过基线的多少倍时自动降并发，0 关闭自适应 |
+| `-slow-threshold` | 2s | 控制台 Top 5 和 JSON Top 10 的慢页面阈值，例如 `3s` / `500ms`；超时始终列出，不影响自动学习或自适应降速 |
 | `-limit` | 0 | 只处理 sitemap 中的前 N 个页面（灰度试跑），0 全部 |
 | `-exclude` | 空 | 排除 URL 包含这些子串的页面，逗号分隔，如 `-exclude=/user,/tags` |
 | `-no-learn` | false | 关闭毒页面自动学习（默认连续 3 天超时才自动排除） |
@@ -172,7 +173,7 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | `-lastmod` | 0 | 只预热最近该时长内变更的页面，如 `24h`；0 全部 |
 | `-json` | 空 | JSON 报告输出路径 |
 | `-log` | 程序目录/pre-cache.log | 日志路径；传 `none` 关闭文件日志 |
-| `-max-error-rate` | 0 | 错误率(%)超过该值时以退出码 3 结束；0 不检查 |
+| `-max-error-rate` | 0 | 首轮或复检的服务不可用率(%)超过该值时以退出码 3 结束；0 不检查 |
 | `-version` | - | 显示版本号后退出 |
 | `-debug` | false | 调试输出 |
 
@@ -181,8 +182,8 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | 码 | 含义 |
 |----|------|
 | 0 | 正常完成 |
-| 1 | 致命错误（sitemap 拉取/解析失败、无任何页面） |
-| 3 | 错误率超过 `-max-error-rate` 阈值（只算 5xx / 超时，404 不算） |
+| 1 | 致命错误（健康检查失败、任一 sitemap 拉取失败、空 sitemap、指定的 JSON 报告写入失败） |
+| 3 | 首轮或复检的服务不可用率超过 `-max-error-rate` 阈值（5xx / 429 / 网络异常，其他 4xx 不算） |
 | 4 | 触发熔断：连续失败过多，目标站点疑似过载 |
 | 130 | 被信号中断（Ctrl+C / SIGTERM） |
 
@@ -214,6 +215,8 @@ CONCURRENCY ≤ pm.max_children / 3
 
 ### rate 取多少
 
+动态站的安全默认值为 `-size=1 -rate=2 -delay=0`。配置了全局 QPS 后，`-delay` 会在响应结束后额外等待；例如 364 个页面、500ms 间隔，固定等待累计约 3 分钟。设为 0 可去掉这部分等待，但实际节省时间仍取决于响应耗时和全局限速。
+
 `size` 定好之后，`rate` 只影响"多久跑完"。串行时实际速率 = `1/单页响应时间`，`rate` 设得比它大也没用。
 
 | 场景 | size | rate | 300 页耗时 |
@@ -243,7 +246,7 @@ CONCURRENCY ≤ pm.max_children / 3
 
 ### 毒页面自动学习与慢页面报告
 
-预热结束时会输出最慢的页面 Top 5（超过 0.5s 才列出）。自动学习以请求是否达到 `-timeout` 超时为准（默认 10 秒），仅耗时较长但未超时的页面只会出现在慢页面报告里。
+预热结束时输出最慢的页面 Top 5，默认只列出单次请求耗时 **超过 2 秒** 的页面，超时页面始终列出。可通过 `-slow-threshold=3s` 或脚本配置 `SLOW_THRESHOLD=3s` 调整；JSON 的 Top 10 使用同一阈值。榜单只用于观察，与自动降并发的 `-slow-ratio` 和请求超时的 `-timeout` 相互独立。自动学习以请求是否达到 `-timeout` 超时为准（默认 10 秒），仅耗时较长但未超时的页面只会出现在慢页面报告里。
 
 同一原始 URL **连续 3 个自然日超时**才写入 `slow-pages.txt`，之后的运行才自动排除。观察期间仍然正常请求该链接：
 
@@ -255,7 +258,7 @@ CONCURRENCY ≤ pm.max_children / 3
 前两天的日志示例：
 
 ```
-最慢的页面 Top 5（预热耗时，>0.5s 才列出）：
+最慢的页面 Top 1（单次请求耗时 >2s，超时页面始终列出）：
        10s  https://www.example.com/user  ← 超时
 慢页面观察：https://www.example.com/user（连续超时 1/3 天，暂不排除）
 ```
@@ -268,13 +271,13 @@ CONCURRENCY ≤ pm.max_children / 3
 
 观察记录自动保存在排除文件路径加 `.history.json` 的文件中（默认 `slow-pages.txt.history.json`），以便跨运行累计。该文件由程序维护，临时记录不会用于跳过页面。使用 `-learn-file` 时，两个文件的位置会一起改变；`-no-learn` 同时关闭历史排除的加载和观察记录的更新。
 
-已有 `slow-pages.txt` 中的条目仍然有效。升级前因偶发超时被加入的链接，可以从该文件删除，让它重新参与预热和观察；如果还需清空累计记录，可同时删除对应的 `.history.json` 文件。
+已有 `slow-pages.txt` 中的完整 URL 条目仍然有效，并采用精确匹配（`/post/1` 不会误排除 `/post/10`）。手动 `-exclude` 继续使用子串匹配。升级前因偶发超时被加入的链接，可以从该文件删除，让它重新参与预热和观察；如果还需清空累计记录，可同时删除对应的 `.history.json` 文件。
 
 JSON 报告里同样有 `slowest` 字段（Top 10，含耗时），可直接接入监控。确认连续多天超时的页面可以作为排查慢 SQL、外部调用等性能问题的线索。
 
 ### 预热前健康检查
 
-正式预热前会先 GET 一次站点根路径：返回 5xx 或完全无响应时直接中止（退出码 1），避免在故障站点上继续加压。
+正式预热前会先 GET 一次站点根路径：返回 5xx / 429 或请求失败（包括响应体超时）时直接中止（退出码 1），避免在故障站点上继续加压。
 
 ```
 健康检查：GET https://www.example.com/
@@ -329,7 +332,11 @@ Accept-Encoding: gzip（由 Go 自动添加并透明解压）
 - **不可缓存**：CDN 规则决定不缓存的页面（需要改缓存规则，预热无效）
 - **缺少缓存标识头**：CDN 没有返回该头，通常说明 `-cacheheader` 配错了
 - **404 / HTTP 错误 / 请求异常**：失败明细会单独列出，便于清理死链
-- **复检结果**：等待后重新探测 MISS 页面，得出真实生效比例
+- **复检结果**：只在首轮存在 MISS 时等待并复检，生效比例 = 复检 HIT 数 / 全部待复检页面数；HTTP 错误、网络异常和中断不会从分母中消失，失败详情写入 `recheck.failures`；`recheck.miss` 只统计真实 MISS，所有未命中项（含错误和中断）使用 `recheck.not_hit`
+- **JSON 完整性**：报告使用临时文件加原子替换写入，避免读取到半份报告；指定报告但写入失败会非零退出。`exit_code` 记录任务状态，`requests` 包括健康检查、sitemap、重试、重定向与复检，`avg_rps` 按实际请求数及总耗时计算，`duration_sec` 包含复检等待
+- **增量筛选**：输出筛选前后的数量及缺少有效 `lastmod` 的页面数；未知修改时间的页面仍保留，避免漏预热，并明确提示增量可能退化为全量
+- **增量无变更**：有效 sitemap 经 `-lastmod` 过滤后无页面时正常退出 0，空 sitemap 仍视为错误
+- **sitemap 完整性**：任一子 sitemap 拉取失败都会中止任务，避免只预热部分页面却报告成功
 
 ## 常见 CDN 缓存标识头
 
@@ -368,17 +375,17 @@ SHELL=/bin/bash
 PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 # 每小时增量
-5 * * * * /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
+5 * * * * LASTMOD=2h /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 
 # 每天全量 + 复检
-10 3 * * * RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
+10 3 * * * LASTMOD=0 RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 ```
 
 脚本还包含：
 
-- Linux / macOS 自动选择可执行文件，并校验二进制版本
+- 仅支持 Linux，按 amd64 / arm64 自动选择可执行文件，并校验二进制版本
 - `SITEMAP_URL` 仍是占位地址时直接报错，避免预热到别人的站点
-- 防重叠执行锁（`flock`，macOS 降级为 mkdir + PID）
+- 防重叠执行锁（优先 `flock`，未安装时使用 mkdir + PID），中断时转发信号并等待子进程退出
 - 输出重定向到 `$SCRIPT_DIR/cron.log` 时自动轮转（超 5MB）
 
 ## 注意事项

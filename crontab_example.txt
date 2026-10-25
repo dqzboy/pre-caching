@@ -34,7 +34,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #             复检结果会直接打印"X 个页面中 Y 个已命中"
 # JSON_OUT    把结果写成 JSON，方便接监控或对比历史
 # ---------------------------------------------------------------------------
-10 3 * * * RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
+10 3 * * * LASTMOD=0 RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 
 # ===========================================================================
 # 时间格式：分 时 日 月 周

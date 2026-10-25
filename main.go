@@ -1,7 +1,7 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"compress/gzip"
 	"context"
 	"crypto/tls"
@@ -11,6 +11,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"math"
 	"math/rand"
 	"net"
 	"net/http"
@@ -34,7 +35,7 @@ import (
 
 // version 版本号。run_precache.sh 会通过 -version 输出判断二进制是否过旧，
 // 因此修改版本号输出格式时请同步检查脚本的版本自检逻辑。
-const version = "2.5.0"
+const version = "2.6.0"
 
 // 预缓存的目标是"像真实访客那样把页面打进缓存"，所以默认请求头按浏览器构造：
 //   - UA 用常见浏览器串：大量 WAF / Bot 管理（Cloudflare SBFM、云厂商 WAF、
@@ -194,29 +195,30 @@ func classifyCache(raw string) Class {
 // ---------------------------------------------------------------------------
 
 type Config struct {
-	Sitemap     string
-	Host        string
-	CacheHeader string
-	UserAgent   string
-	Concurrency int
-	Timeout     time.Duration
-	Delay       time.Duration
-	Rate        float64
-	Retries     int
-	UseHead     bool
-	Insecure    bool
-	Debug       bool
-	Recheck     time.Duration
-	LastMod     time.Duration
-	JSONPath    string
-	LogPath     string
-	MaxErrRate  float64
-	Limit       int      // 只处理前 N 个页面（灰度），0 表示全部
-	MaxFail     int      // 连续失败多少个请求后熔断，0 表示关闭熔断
-	SlowRatio   float64  // 平均耗时超过基线的多少倍就自动降速，0 表示关闭
-	Exclude     []string // 排除 URL 包含这些子串的页面（毒页面过滤）
-	NoLearn     bool     // 关闭毒页面自动学习
-	LearnPath   string   // 毒页面学习文件路径（slow-pages.txt）
+	Sitemap       string
+	Host          string
+	CacheHeader   string
+	UserAgent     string
+	Concurrency   int
+	Timeout       time.Duration
+	Delay         time.Duration
+	Rate          float64
+	Retries       int
+	UseHead       bool
+	Insecure      bool
+	Debug         bool
+	Recheck       time.Duration
+	LastMod       time.Duration
+	JSONPath      string
+	LogPath       string
+	MaxErrRate    float64
+	Limit         int           // 只处理前 N 个页面（灰度），0 表示全部
+	MaxFail       int           // 连续失败多少个请求后熔断，0 表示关闭熔断
+	SlowRatio     float64       // 平均耗时超过基线的多少倍就自动降速，0 表示关闭
+	SlowThreshold time.Duration // 慢页面榜单阈值，与超时学习、自适应降速无关
+	Exclude       []string      // 排除 URL 包含这些子串的页面（毒页面过滤）
+	NoLearn       bool          // 关闭毒页面自动学习
+	LearnPath     string        // 毒页面学习文件路径（slow-pages.txt）
 }
 
 // ---------------------------------------------------------------------------
@@ -244,14 +246,16 @@ type Result struct {
 }
 
 type PreCache struct {
-	cfg       Config
-	client    *http.Client
-	out       *Printer
-	pacer     *pacer
-	scheme    string
-	domain    string
-	transport *http.Transport
-	startTime time.Time
+	cfg        Config
+	client     *http.Client
+	out        *Printer
+	pacer      *pacer
+	scheme     string
+	domain     string
+	transport  *http.Transport
+	startTime  time.Time
+	discovered int   // 增量过滤前的有效 URL 数，用于区分空 sitemap 和无需更新
+	requests   int64 // 实际 HTTP 请求数，包含重试、重定向和 sitemap
 
 	// 熔断相关：目标站点一旦整体不可用，继续跑只会把源站踩得更死。
 	// consecFail 记录"连续"失败数，中间只要成功一次就清零。
@@ -262,12 +266,30 @@ type PreCache struct {
 
 func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 	parsed, err := url.Parse(cfg.Sitemap)
-	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
 		return nil, fmt.Errorf("sitemap 地址解析失败：%s", cfg.Sitemap)
 	}
 
 	if cfg.UserAgent == "" {
 		cfg.UserAgent = defaultUserAgent
+	}
+	if math.IsNaN(cfg.Rate) || math.IsInf(cfg.Rate, 0) || cfg.Rate < 0 || cfg.Rate > 1e9 {
+		return nil, fmt.Errorf("-rate 必须是 0 到 1000000000 之间的有限数字")
+	}
+	if cfg.Rate > 0 && float64(time.Second)/cfg.Rate >= float64(math.MaxInt64) {
+		return nil, fmt.Errorf("-rate 太小，限速间隔超出可表示范围")
+	}
+	if math.IsNaN(cfg.SlowRatio) || math.IsInf(cfg.SlowRatio, 0) || cfg.SlowRatio < 0 {
+		return nil, fmt.Errorf("-slow-ratio 必须是非负有限数字")
+	}
+	if math.IsNaN(cfg.MaxErrRate) || math.IsInf(cfg.MaxErrRate, 0) || cfg.MaxErrRate < 0 || cfg.MaxErrRate > 100 {
+		return nil, fmt.Errorf("-max-error-rate 必须在 0 到 100 之间")
+	}
+	if cfg.SlowThreshold < 0 {
+		return nil, fmt.Errorf("-slow-threshold 必须大于 0")
+	}
+	if cfg.SlowThreshold == 0 {
+		cfg.SlowThreshold = 2 * time.Second
 	}
 	if cfg.Concurrency < 1 {
 		cfg.Concurrency = 1
@@ -290,9 +312,6 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 	if cfg.MaxFail < 0 {
 		cfg.MaxFail = 0
 	}
-	if cfg.SlowRatio < 0 {
-		cfg.SlowRatio = 0
-	}
 
 	// 自定义 Transport 不会自动启用 HTTP/2，必须显式打开。
 	// MaxIdleConnsPerHost 至少要等于并发数，否则连接池会被反复新建。
@@ -310,18 +329,11 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 		TLSClientConfig:       &tls.Config{InsecureSkipVerify: !cfg.Insecure}, // 修复：-verify 此前完全未生效
 	}
 
-	return &PreCache{
+	pc := &PreCache{
 		cfg: cfg,
 		client: &http.Client{
 			Transport: tr,
 			Timeout:   cfg.Timeout,
-			// 不无限跟随重定向：每个重定向都是一次隐形请求，会放大源站压力
-			CheckRedirect: func(req *http.Request, via []*http.Request) error {
-				if len(via) >= 2 {
-					return fmt.Errorf("已跟随 2 次重定向，停止")
-				}
-				return nil
-			},
 		},
 		out:       out,
 		pacer:     newPacer(cfg.Rate),
@@ -329,7 +341,29 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 		domain:    parsed.Host,
 		transport: tr,
 		startTime: time.Now(),
-	}, nil
+	}
+	pc.client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		if len(via) >= 2 {
+			return fmt.Errorf("已跟随 1 次重定向，停止")
+		}
+		pc.pacer.wait(req.Context())
+		if err := req.Context().Err(); err != nil {
+			return err
+		}
+		atomic.AddInt64(&pc.requests, 1)
+		return nil
+	}
+	return pc, nil
+}
+
+// 所有网络请求共用同一限速器；重定向由 CheckRedirect 单独领取配额。
+func (pc *PreCache) do(req *http.Request) (*http.Response, error) {
+	pc.pacer.wait(req.Context())
+	if err := req.Context().Err(); err != nil {
+		return nil, err
+	}
+	atomic.AddInt64(&pc.requests, 1)
+	return pc.client.Do(req)
 }
 
 // ---------------------------------------------------------------------------
@@ -370,7 +404,7 @@ func (pc *PreCache) getBytes(ctx context.Context, target string) ([]byte, error)
 	}
 	pc.setBrowserHeaders(req)
 
-	resp, err := pc.client.Do(req)
+	resp, err := pc.do(req)
 	if err != nil {
 		return nil, err
 	}
@@ -381,10 +415,12 @@ func (pc *PreCache) getBytes(ctx context.Context, target string) ([]byte, error)
 		return nil, fmt.Errorf("HTTP %d", resp.StatusCode)
 	}
 
-	// sitemap 可能以 .gz 形式提供，也可能直接返回 gzip 编码的内容
-	var reader io.Reader = resp.Body
-	if strings.HasSuffix(strings.ToLower(target), ".gz") {
-		gz, gzErr := gzip.NewReader(resp.Body)
+	// 按实际魔数解压，兼容 .gz?query 与 Transport 已透明解压的响应。
+	buffered := bufio.NewReader(resp.Body)
+	var reader io.Reader = buffered
+	magic, _ := buffered.Peek(2)
+	if len(magic) == 2 && magic[0] == 0x1f && magic[1] == 0x8b {
+		gz, gzErr := gzip.NewReader(buffered)
 		if gzErr != nil {
 			return nil, fmt.Errorf("解压 gzip 失败：%w", gzErr)
 		}
@@ -392,26 +428,15 @@ func (pc *PreCache) getBytes(ctx context.Context, target string) ([]byte, error)
 		reader = gz
 	}
 
-	data, err := io.ReadAll(io.LimitReader(reader, maxSitemapBytes))
+	data, err := io.ReadAll(io.LimitReader(reader, maxSitemapBytes+1))
 	if err != nil {
 		return nil, err
 	}
 
-	// 通过魔数兜底识别 gzip
-	if len(data) > 2 && data[0] == 0x1f && data[1] == 0x8b {
-		gz, gzErr := gzip.NewReader(bytes.NewReader(data))
-		if gzErr == nil {
-			if unzipped, readErr := io.ReadAll(io.LimitReader(gz, maxSitemapBytes)); readErr == nil {
-				data = unzipped
-			}
-			gz.Close()
-		}
-	}
-
 	// LimitReader 读满 64MB 基本就是被截断了：XML 会解析失败然后降级到正则
 	// 提取，静默漏掉后面的 URL，用户还以为预热完整。显式报错比静默缺页强。
-	if int64(len(data)) >= maxSitemapBytes {
-		return nil, fmt.Errorf("sitemap 超过 %dMB 上限已被截断，请拆分站点地图或用 -limit 缩小范围", maxSitemapBytes>>(10*2))
+	if int64(len(data)) > maxSitemapBytes {
+		return nil, fmt.Errorf("sitemap 超过 %dMB 上限，请拆分站点地图", maxSitemapBytes>>(10*2))
 	}
 
 	return data, nil
@@ -450,12 +475,13 @@ func (pc *PreCache) loadPages(ctx context.Context) ([]Page, error) {
 			text := string(data)
 			pc.out.Muted("  XML 解析失败（%v），改用正则提取：%s", xmlErr, target)
 			if strings.Contains(text, "<sitemapindex") {
+				var childErrors []error
 				for _, m := range locPattern.FindAllStringSubmatch(text, -1) {
 					if err := walk(m[1], depth+1); err != nil {
-						pc.out.Warn("  %v", err)
+						childErrors = append(childErrors, err)
 					}
 				}
-				return nil
+				return errors.Join(childErrors...)
 			}
 			for _, m := range locPattern.FindAllStringSubmatch(text, -1) {
 				pc.appendPage(&pages, seenPage, m[1], time.Time{})
@@ -465,12 +491,14 @@ func (pc *PreCache) loadPages(ctx context.Context) ([]Page, error) {
 
 		switch doc.XMLName.Local {
 		case "sitemapindex":
+			var childErrors []error
 			pc.out.Muted("  发现 sitemap 索引，包含 %d 个子 sitemap：%s", len(doc.Sitemaps), target)
 			for _, s := range doc.Sitemaps {
 				if err := walk(strings.TrimSpace(s.Loc), depth+1); err != nil {
-					pc.out.Warn("  %v", err)
+					childErrors = append(childErrors, err)
 				}
 			}
+			return errors.Join(childErrors...)
 		default: // urlset 或未声明根节点
 			for _, u := range doc.URLs {
 				pc.appendPage(&pages, seenPage, u.Loc, parseLastMod(u.LastMod))
@@ -483,16 +511,25 @@ func (pc *PreCache) loadPages(ctx context.Context) ([]Page, error) {
 		return nil, err
 	}
 
+	pc.discovered = len(pages)
 	// 增量模式：只保留最近变更的页面
 	if pc.cfg.LastMod > 0 {
 		cutoff := time.Now().Add(-pc.cfg.LastMod)
 		kept := pages[:0]
+		unknown := 0
 		for _, p := range pages {
+			if p.LastMod.IsZero() {
+				unknown++
+			}
 			if p.LastMod.IsZero() || p.LastMod.After(cutoff) {
 				kept = append(kept, p)
 			}
 		}
 		pages = kept
+		pc.out.Info("增量筛选：%d 个页面保留 %d 个（缺少有效 lastmod：%d）", pc.discovered, len(pages), unknown)
+		if unknown > 0 {
+			pc.out.Warn("  缺少有效 lastmod 的页面仍会预热；增量可能退化为全量，请检查 sitemap 的修改时间字段")
+		}
 	}
 
 	return pages, nil
@@ -545,12 +582,6 @@ func parseLastMod(s string) time.Time {
 // 单次探测（含重试）
 // ---------------------------------------------------------------------------
 
-// maxDrain：归还连接前最多读多少响应体。
-// 预热的目的只是"触发渲染 + 写缓存"，不需要消费完整内容。
-// 设小一点：普通 HTML 页面远小于 512KB，连接照常复用；
-// 偶尔命中大文件时最多损失一次握手，换来不白白下载 8MB。
-const maxDrain = 512 << 10
-
 func (pc *PreCache) probe(ctx context.Context, p Page) Result {
 	method := http.MethodGet
 	if pc.cfg.UseHead {
@@ -568,6 +599,12 @@ func (pc *PreCache) probe(ctx context.Context, p Page) Result {
 		res, retryable := pc.once(ctx, p, method)
 		res.Attempts = attempt + 1
 		last = res
+		if ctx.Err() == nil {
+			pc.noteResult(res)
+		}
+		if pc.aborted() {
+			return res
+		}
 		if !retryable {
 			return res
 		}
@@ -579,7 +616,6 @@ func (pc *PreCache) probe(ctx context.Context, p Page) Result {
 }
 
 func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bool) {
-	start := time.Now()
 	res := Result{Page: p}
 
 	req, err := http.NewRequestWithContext(ctx, method, p.URL, nil)
@@ -594,8 +630,18 @@ func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bo
 		req.Host = pc.domain
 	}
 
+	// 限速等待不属于页面响应耗时。
+	pc.pacer.wait(ctx)
+	if ctx.Err() != nil {
+		return res, false
+	}
+	start := time.Now()
+	atomic.AddInt64(&pc.requests, 1)
 	resp, err := pc.client.Do(req)
 	if err != nil {
+		if ctx.Err() != nil {
+			return res, false
+		}
 		res.Class = ClassException
 		res.Err = simplifyErr(err)
 		res.Elapsed = time.Since(start)
@@ -613,11 +659,22 @@ func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bo
 	defer resp.Body.Close()
 
 	// 关键修复：必须把 body 读完，连接才能归还连接池被复用
-	n, _ := io.Copy(io.Discard, io.LimitReader(resp.Body, maxDrain))
-	_ = n
+	// 流式读完响应体才能确认预热完成、复用连接；内存不随页面大小增长。
+	_, readErr := io.Copy(io.Discard, resp.Body)
 
 	res.Status = resp.StatusCode
 	res.Elapsed = time.Since(start)
+	if readErr != nil {
+		if ctx.Err() != nil {
+			res.Status = 0
+			res.Class = ClassSkipped
+			return res, false
+		}
+		res.Class = ClassException
+		res.Err = simplifyErr(readErr)
+		res.Timeout = isTimeoutErr(readErr)
+		return res, !res.Timeout
+	}
 	if pc.cfg.CacheHeader != "" {
 		res.CacheRaw = resp.Header.Get(pc.cfg.CacheHeader)
 	}
@@ -647,14 +704,11 @@ func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bo
 
 func backoff(attempt int, retryAfter time.Duration) time.Duration {
 	if retryAfter > 0 {
-		if retryAfter > 30*time.Second {
-			retryAfter = 30 * time.Second
-		}
 		return retryAfter
 	}
-	d := time.Duration(300<<uint(attempt-1)) * time.Millisecond // 300ms, 600ms, 1.2s...
-	if d > 10*time.Second {
-		d = 10 * time.Second
+	d := 10 * time.Second
+	if attempt > 0 && attempt <= 6 {
+		d = (300 * time.Millisecond) << uint(attempt-1)
 	}
 	// 加抖动，避免重试风暴
 	return d + time.Duration(rand.Int63n(int64(d/2+1)))
@@ -666,6 +720,12 @@ func parseRetryAfter(v string) time.Duration {
 		return 0
 	}
 	if secs, err := strconv.Atoi(v); err == nil {
+		if secs <= 0 {
+			return 0
+		}
+		if uint64(secs) > uint64(math.MaxInt64/int64(time.Second)) {
+			return time.Duration(math.MaxInt64)
+		}
 		return time.Duration(secs) * time.Second
 	}
 	if t, err := http.ParseTime(v); err == nil {
@@ -711,6 +771,10 @@ func (pc *PreCache) healthCheck(ctx context.Context) error {
 	pc.out.Info("健康检查：GET %s", u)
 	res, _ := pc.once(ctx, Page{RawURL: u, URL: pc.rewrite(u)}, http.MethodGet)
 	switch {
+	case ctx.Err() != nil:
+		return ctx.Err()
+	case res.Status == http.StatusTooManyRequests:
+		return fmt.Errorf("健康检查失败：%s 返回 HTTP 429，目标站点要求限流，中止预热", u)
 	case res.Status >= 500:
 		return fmt.Errorf("健康检查失败：%s 返回 HTTP %d，源站异常，中止预热", u, res.Status)
 	case res.Class == ClassException:
@@ -782,7 +846,7 @@ func (pc *PreCache) saveLearnedAt(results []Result, now time.Time) {
 	// 都不是页面恢复正常的证据，也不能累计超时天数。
 	observed := map[string]bool{} // true：超时；false：当天有正常响应
 	for _, r := range results {
-		if r.Page.RawURL == "" || (!r.Timeout && r.Status == 0) {
+		if r.Page.RawURL == "" || r.Class == ClassSkipped || (!r.Timeout && (r.Status == 0 || r.Class == ClassException)) {
 			continue
 		}
 		previous, seen := observed[r.Page.RawURL]
@@ -1145,7 +1209,7 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 	th := newThrottle(workers, pc.cfg.SlowRatio, pc.out)
 	defer func() {
 		if n := th.reductions(); n > 0 {
-			pc.out.Warn("  本轮共触发 %d 次自动降速，最终并发 %d（源站负载不足，建议降低 -size）",
+			pc.out.Warn("  本轮共触发 %d 次自动降速，最终并发 %d（源站响应变慢，建议降低 -size）",
 				n, th.limitNow())
 		}
 	}()
@@ -1167,7 +1231,6 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 				if !lastEnd.IsZero() && pc.cfg.Delay > 0 {
 					sleep(runCtx, pc.cfg.Delay-time.Since(lastEnd))
 				}
-				pc.pacer.wait(runCtx)
 				if runCtx.Err() != nil {
 					return
 				}
@@ -1182,7 +1245,6 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 				results[idx] = res
 				lastEnd = time.Now()
 				th.observe(res.Elapsed)
-				pc.noteResult(res)
 
 				if progressEvery > 0 {
 					if n := atomic.AddInt64(&done, 1); n%progressEvery == 0 {
@@ -1223,6 +1285,7 @@ type Stats struct {
 	Unclassified int
 	Skipped      int
 	Retried      int
+	ServerErrors int // 5xx、429 和网络异常；用于源站不可用率
 	StatusCodes  map[int]int
 	Failures     []Result
 }
@@ -1260,6 +1323,9 @@ func summarize(results []Result) Stats {
 		if r.Class == ClassNotFound || r.Class == ClassHTTPError || r.Class == ClassException {
 			s.Failures = append(s.Failures, r)
 		}
+		if r.Class != ClassSkipped && (r.Status >= 500 || r.Status == http.StatusTooManyRequests || r.Class == ClassException) {
+			s.ServerErrors++
+		}
 	}
 	return s
 }
@@ -1280,14 +1346,15 @@ func (s Stats) blocked() int {
 		s.StatusCodes[http.StatusServiceUnavailable]
 }
 
-// errRate 只统计"服务端不可用"的比例。
+// errRate 只统计已执行页面的服务不可用比例（5xx / 429 / 网络异常）。
 // 404 不计入：sitemap 里存在死链是常态，把它算成错误会让 -max-error-rate
 // 每天误报警，最后没人再信这个指标。
 func (s Stats) errRate() float64 {
-	if s.Total == 0 {
+	completed := s.Total - s.Skipped
+	if completed == 0 {
 		return 0
 	}
-	return float64(s.HTTPError+s.Exception) / float64(s.Total) * 100
+	return float64(s.ServerErrors) / float64(completed) * 100
 }
 
 func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string) {
@@ -1296,7 +1363,7 @@ func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string) {
 	pc.out.Info("---------------------------------------------------------")
 	pc.out.Hint("%s：页面总数 %d，耗时 %s", title, s.Total, elapsed.Round(time.Millisecond))
 	if s.Total > 0 && elapsed > 0 {
-		pc.out.Muted("平均吞吐：%.1f req/s", float64(s.Total)/elapsed.Seconds())
+		pc.out.Muted("平均页面吞吐：%.1f pages/s", float64(s.Total-s.Skipped)/elapsed.Seconds())
 	}
 
 	if pc.cfg.CacheHeader != "" {
@@ -1368,31 +1435,35 @@ func (pc *PreCache) printFailures(s Stats) {
 // printSlowest 列出最慢的几个页面。
 // 这是定位"毒页面"最直接的输出——超时的重页面问题，
 // 靠的就是这个信息；没有它，用户只能去翻 access log 猜。
-// 只在存在 0.5s 以上的页面时才输出，避免在飞快的小站上刷屏。
-func (pc *PreCache) printSlowest(results []Result) {
-	var rs []Result
+// 只保留固定数量的候选，不复制、排序整批结果。
+func (pc *PreCache) slowest(results []Result, limit int) []Result {
+	rs := make([]Result, 0, limit)
 	for _, r := range results {
-		if r.Elapsed > 0 {
-			rs = append(rs, r)
+		if r.Class == ClassSkipped || (!r.Timeout && r.Elapsed <= pc.cfg.SlowThreshold) {
+			continue
+		}
+		pos := sort.Search(len(rs), func(i int) bool { return rs[i].Elapsed < r.Elapsed })
+		if pos >= limit {
+			continue
+		}
+		rs = append(rs, r)
+		copy(rs[pos+1:], rs[pos:len(rs)-1])
+		rs[pos] = r
+		if len(rs) > limit {
+			rs = rs[:limit]
 		}
 	}
+	return rs
+}
+
+func (pc *PreCache) printSlowest(results []Result) {
+	rs := pc.slowest(results, 5)
 	if len(rs) == 0 {
 		return
 	}
-	sort.Slice(rs, func(i, j int) bool { return rs[i].Elapsed > rs[j].Elapsed })
-	if len(rs) > 5 {
-		rs = rs[:5]
-	}
-	if rs[0].Elapsed < 500*time.Millisecond {
-		return
-	}
-
 	pc.out.Info("---------------------------------------------------------")
-	pc.out.Hint("最慢的页面 Top %d（预热耗时，>0.5s 才列出）：", len(rs))
+	pc.out.Hint("最慢的页面 Top %d（单次请求耗时 >%v，超时页面始终列出）：", len(rs), pc.cfg.SlowThreshold)
 	for _, r := range rs {
-		if r.Elapsed < 500*time.Millisecond {
-			break
-		}
 		mark := ""
 		if r.Timeout {
 			mark = "  ← 超时"
@@ -1437,31 +1508,46 @@ type jsonSlow struct {
 }
 
 type jsonRecheck struct {
-	WaitSeconds float64 `json:"wait_seconds"`
-	Hit         int     `json:"hit"`
-	Miss        int     `json:"miss"`
-	HitRate     float64 `json:"hit_rate"`
+	WaitSeconds  float64       `json:"wait_seconds"`
+	Hit          int           `json:"hit"`
+	Miss         int           `json:"miss"`
+	NotHit       int           `json:"not_hit"`
+	HitRate      float64       `json:"hit_rate"`
+	Total        int           `json:"total"`
+	HTTPError    int           `json:"http_error"`
+	Exception    int           `json:"exception"`
+	Skipped      int           `json:"skipped"`
+	NotFound     int           `json:"not_found"`
+	Uncacheable  int           `json:"uncacheable"`
+	NoHeader     int           `json:"no_header"`
+	Unclassified int           `json:"unclassified"`
+	ErrorRate    float64       `json:"error_rate"`
+	Failures     []jsonFailure `json:"failures,omitempty"`
 }
 
 type jsonReport struct {
-	Version     string         `json:"version"`
-	StartTime   string         `json:"start_time"`
-	EndTime     string         `json:"end_time"`
-	DurationSec float64        `json:"duration_sec"`
-	Sitemap     string         `json:"sitemap"`
-	Host        string         `json:"host,omitempty"`
-	Total       int            `json:"total"`
-	Counts      map[string]int `json:"counts"`
-	StatusCodes map[string]int `json:"status_codes"`
-	HitRate     float64        `json:"hit_rate"`
-	ErrorRate   float64        `json:"error_rate"`
-	AvgRPS      float64        `json:"avg_rps"`
-	Failures    []jsonFailure  `json:"failures,omitempty"`
-	Slowest     []jsonSlow     `json:"slowest,omitempty"`
-	Recheck     *jsonRecheck   `json:"recheck,omitempty"`
+	Version          string         `json:"version"`
+	StartTime        string         `json:"start_time"`
+	EndTime          string         `json:"end_time"`
+	DurationSec      float64        `json:"duration_sec"`
+	Sitemap          string         `json:"sitemap"`
+	Host             string         `json:"host,omitempty"`
+	Total            int            `json:"total"`
+	Counts           map[string]int `json:"counts"`
+	StatusCodes      map[string]int `json:"status_codes"`
+	HitRate          float64        `json:"hit_rate"`
+	ErrorRate        float64        `json:"error_rate"`
+	AvgRPS           float64        `json:"avg_rps"`
+	Failures         []jsonFailure  `json:"failures,omitempty"`
+	Slowest          []jsonSlow     `json:"slowest,omitempty"`
+	Recheck          *jsonRecheck   `json:"recheck,omitempty"`
+	Completed        int            `json:"completed"`
+	Requests         int64          `json:"requests"`
+	ExitCode         int            `json:"exit_code"`
+	SlowThresholdSec float64        `json:"slow_threshold_sec"`
 }
 
-func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed time.Duration, rc *jsonRecheck) error {
+func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed time.Duration, rc *jsonRecheck, exitCode int) error {
 	hitRate, _ := s.hitRate()
 	rep := jsonReport{
 		Version:     version,
@@ -1478,13 +1564,17 @@ func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed ti
 			"unclassified": s.Unclassified,
 			"skipped":      s.Skipped, "retried": s.Retried,
 		},
-		StatusCodes: map[string]int{},
-		HitRate:     hitRate,
-		ErrorRate:   s.errRate(),
-		Recheck:     rc,
+		StatusCodes:      map[string]int{},
+		HitRate:          hitRate,
+		ErrorRate:        s.errRate(),
+		Recheck:          rc,
+		Completed:        s.Total - s.Skipped,
+		Requests:         atomic.LoadInt64(&pc.requests),
+		ExitCode:         exitCode,
+		SlowThresholdSec: pc.cfg.SlowThreshold.Seconds(),
 	}
 	if elapsed > 0 {
-		rep.AvgRPS = float64(s.Total) / elapsed.Seconds()
+		rep.AvgRPS = float64(rep.Requests) / elapsed.Seconds()
 	}
 	for c, n := range s.StatusCodes {
 		rep.StatusCodes[strconv.Itoa(c)] = n
@@ -1496,17 +1586,7 @@ func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed ti
 		})
 	}
 	// 慢页面写进报告，方便监控直接盯"源站上哪些页面最重"
-	var slow []Result
-	for _, r := range results {
-		if r.Elapsed >= 500*time.Millisecond {
-			slow = append(slow, r)
-		}
-	}
-	sort.Slice(slow, func(i, j int) bool { return slow[i].Elapsed > slow[j].Elapsed })
-	if len(slow) > 10 {
-		slow = slow[:10]
-	}
-	for _, r := range slow {
+	for _, r := range pc.slowest(results, 10) {
 		rep.Slowest = append(rep.Slowest, jsonSlow{
 			URL:     r.Page.RawURL,
 			Seconds: r.Elapsed.Seconds(),
@@ -1518,7 +1598,29 @@ func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed ti
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path, append(data, '\n'), 0644)
+	return writeAtomic(path, append(data, '\n'))
+}
+
+func writeAtomic(path string, data []byte) error {
+	mode := os.FileMode(0644)
+	if info, err := os.Stat(path); err == nil {
+		mode = info.Mode().Perm()
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".precache-report-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	if err := f.Chmod(mode); err != nil {
+		_ = f.Close()
+		return err
+	}
+	_, writeErr := f.Write(data)
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1540,7 +1642,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	if pc.cfg.Rate > 0 {
 		pc.out.Info("全局限速：%.1f req/s", pc.cfg.Rate)
 	} else {
-		pc.out.Warn("全局限速：已关闭（-rate=0），压力只靠 -delay 兜底，请确认这是你要的")
+		pc.out.Warn("全局限速：已关闭（-rate=0），压力仅受并发与额外间隔限制，请确认这是你要的")
 	}
 	pc.out.Info("请求间隔：%v（每个并发槽内）", pc.cfg.Delay)
 	pc.out.Info("超时时间：%v，重试：%d 次", pc.cfg.Timeout, pc.cfg.Retries)
@@ -1565,34 +1667,45 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	pc.out.Hint("预缓存开始:")
 	pc.out.Info("---------------------------------------------------------")
 
-	// 合并历史毒页面：把 slow-pages.txt 里的 URL 子串并入排除列表。
-	// 这里只加载已经确认的页面，观察中的页面继续正常预热。
-	if learned := pc.loadLearned(); len(learned) > 0 {
-		pc.cfg.Exclude = append(pc.cfg.Exclude, learned...)
+	// 手动排除保留子串语义；学习出的完整 URL 使用精确匹配。
+	learned := map[string]bool{}
+	for _, u := range pc.loadLearned() {
+		learned[u] = true
+	}
+	if len(learned) > 0 {
 		pc.out.Muted("已从学习文件加载 %d 个历史超时页面（本次自动排除）", len(learned))
 	}
 
 	// 预热前健康检查：源站已经故障时直接退出，不往故障上压请求
 	if err := pc.healthCheck(ctx); err != nil {
+		if ctx.Err() != nil {
+			return 130, nil
+		}
 		return 1, err
 	}
 
 	pc.out.Info("开始解析站点地图...")
 	pages, err := pc.loadPages(ctx)
 	if err != nil {
+		if ctx.Err() != nil {
+			return 130, nil
+		}
 		return 1, fmt.Errorf("解析站点地图失败：%w", err)
 	}
-	if len(pages) == 0 {
+	if len(pages) == 0 && !(pc.cfg.LastMod > 0 && pc.discovered > 0) {
 		return 1, fmt.Errorf("未从 sitemap 中提取到任何页面，请检查 sitemap 是否符合规范或 -lastmod 过滤是否过严")
 	}
 	pc.out.Ok("提取网址成功，共 %d 条（已去重）", len(pages))
+	if len(pages) == 0 {
+		pc.out.Ok("增量检查完成：没有最近变更的页面，无需预热")
+	}
 
 	// 过滤手动排除和已经确认连续多天超时的页面。
-	if len(pc.cfg.Exclude) > 0 {
+	if len(pc.cfg.Exclude) > 0 || len(learned) > 0 {
 		kept := pages[:0]
 		excluded := []string{}
 		for _, p := range pages {
-			drop := false
+			drop := learned[p.RawURL]
 			for _, pat := range pc.cfg.Exclude {
 				if strings.Contains(p.RawURL, pat) {
 					drop = true
@@ -1609,7 +1722,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		}
 		if n := len(pages) - len(kept); n > 0 {
 			pages = kept
-			pc.out.Warn("已按 -exclude 排除 %d 个页面，例如：", n)
+			pc.out.Warn("已按手动规则 / 学习记录排除 %d 个页面，例如：", n)
 			for _, u := range excluded {
 				pc.out.Muted("  排除 %s", u)
 			}
@@ -1640,7 +1753,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 
 	// 预热后复检：自动验证缓存是否真的生效
 	var rc *jsonRecheck
-	if pc.cfg.Recheck > 0 && ctx.Err() == nil && !pc.aborted() {
+	if pc.cfg.Recheck > 0 && stats.Miss > 0 && ctx.Err() == nil && !pc.aborted() {
 		pc.out.Info("---------------------------------------------------------")
 		pc.out.Hint("等待 %v 后进行缓存复检...", pc.cfg.Recheck)
 		sleep(ctx, pc.cfg.Recheck)
@@ -1656,74 +1769,86 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		} else {
 			reResults := pc.run(ctx, missPages)
 			reStats := summarize(reResults)
-			rate, _ := reStats.hitRate()
+			rate := float64(reStats.Hit) / float64(len(missPages)) * 100
 			pc.out.Ok("复检结果：%d 个页面中 %d 个已命中（%.1f%%）", len(missPages), reStats.Hit, rate)
 			if reStats.Hit < len(missPages) {
-				pc.out.Warn("仍有 %d 个页面未生效，请检查 CDN 缓存规则（Cookie/Vary/Cache-Control 等）",
+				pc.out.Warn("仍有 %d 个页面未确认命中（含请求错误和未执行），请结合复检明细检查缓存规则或源站响应",
 					len(missPages)-reStats.Hit)
 			}
 			rc = &jsonRecheck{
-				WaitSeconds: pc.cfg.Recheck.Seconds(),
-				Hit:         reStats.Hit,
-				Miss:        len(missPages) - reStats.Hit,
-				HitRate:     rate,
+				WaitSeconds:  pc.cfg.Recheck.Seconds(),
+				Hit:          reStats.Hit,
+				Miss:         reStats.Miss,
+				NotHit:       len(missPages) - reStats.Hit,
+				HitRate:      rate,
+				Total:        len(missPages),
+				HTTPError:    reStats.HTTPError,
+				Exception:    reStats.Exception,
+				Skipped:      reStats.Skipped,
+				NotFound:     reStats.NotFound,
+				Uncacheable:  reStats.Uncacheable,
+				NoHeader:     reStats.NoHeader,
+				Unclassified: reStats.Unclassified,
+				ErrorRate:    reStats.errRate(),
 			}
+			for _, f := range reStats.Failures {
+				rc.Failures = append(rc.Failures, jsonFailure{URL: f.Page.RawURL, Class: f.Class.String(), Status: f.Status, Error: f.Err, Attempts: f.Attempts})
+			}
+			pc.printFailures(reStats)
 		}
 	}
 
 	// 更新每日观察记录，连续多天超时的 URL 才记入 slow-pages.txt。
 	pc.saveLearned(results)
 
-	if pc.cfg.JSONPath != "" {
-		if err := pc.writeJSON(pc.cfg.JSONPath, results, stats, elapsed, rc); err != nil {
-			pc.out.Warn("写入 JSON 报告失败：%v", err)
-		} else {
-			pc.out.Muted("JSON 报告已写入：%s", pc.cfg.JSONPath)
-		}
-	}
-
+	code := 0
 	if pc.aborted() {
-		return 4, nil // 熔断，便于 cron / 监控区分"跑完了"和"被打断"
+		code = 4
+	} else if ctx.Err() != nil {
+		code = 130
+	} else if pc.cfg.MaxErrRate > 0 && (stats.errRate() > pc.cfg.MaxErrRate || (rc != nil && rc.ErrorRate > pc.cfg.MaxErrRate)) {
+		pc.out.Err("首轮或复检的服务不可用率超过阈值 %.1f%%", pc.cfg.MaxErrRate)
+		code = 3
 	}
-
-	if pc.cfg.MaxErrRate > 0 && stats.errRate() > pc.cfg.MaxErrRate {
-		pc.out.Err("错误率 %.1f%% 超过阈值 %.1f%%", stats.errRate(), pc.cfg.MaxErrRate)
-		return 3, nil
+	if pc.cfg.JSONPath != "" {
+		if err := pc.writeJSON(pc.cfg.JSONPath, results, stats, time.Since(pc.startTime), rc, code); err != nil {
+			if code != 0 {
+				return code, fmt.Errorf("写入 JSON 报告失败：%w", err)
+			}
+			return 1, fmt.Errorf("写入 JSON 报告失败：%w", err)
+		}
+		pc.out.Muted("JSON 报告已写入：%s", pc.cfg.JSONPath)
 	}
-
-	if ctx.Err() != nil {
-		return 130, nil // 被信号中断，便于 cron / 监控区分
-	}
-
-	return 0, nil
+	return code, nil
 }
 
 func main() {
 	var (
-		sitemap     = flag.String("sitemap", "", "网站地图地址 (必需)")
-		size        = flag.Int("size", 5, "并发数量，默认 5")
-		timeout     = flag.Int("timeout", 10, "单请求超时（秒），默认 10")
-		delay       = flag.Int("delay", 500, "每个并发槽两次请求之间的间隔（毫秒），默认 500")
-		rate        = flag.Float64("rate", 5, "全局 QPS 上限，默认 5；0 表示完全不限制（不建议，容易压垮源站）")
-		retries     = flag.Int("retry", 2, "失败重试次数（429/408/502/503/504 及网络错误），默认 2")
-		maxFail     = flag.Int("max-fail", 20, "连续多少个请求失败后熔断中止，默认 20；0 关闭熔断")
-		slowRatio   = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
-		limit       = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
-		exclude     = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
-		noLearn     = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：连续 3 天超时才记入 slow-pages.txt 并在下次运行时排除）")
-		learnFile   = flag.String("learn-file", "", "毒页面学习文件路径，默认 <程序目录>/slow-pages.txt")
-		host        = flag.String("host", "", "指定真实主机，例如 127.0.0.1:8080（会同时改写 Host 头）")
-		cacheHeader = flag.String("cacheheader", "", "缓存标识头，例如 x-cache / cf-cache-status")
-		userAgent   = flag.String("useragent", "", "指定 UA，默认 PreCache/2.0")
-		verify      = flag.Bool("verify", false, "是否校验 SSL 证书，默认 false（不校验）")
-		head        = flag.Bool("head", false, "使用 HEAD 请求预热（省流量，但部分 CDN 只缓存 GET）")
-		recheck     = flag.Duration("recheck", 0, "预热后等待该时长再复检，例如 30s / 2m；0 表示不复检")
-		lastMod     = flag.Duration("lastmod", 0, "只预热 sitemap 中最近该时长内变更的页面，例如 24h；0 表示全部")
-		jsonPath    = flag.String("json", "", "将结果写入 JSON 文件，便于接入监控")
-		logPath     = flag.String("log", "", "日志文件路径，默认 <程序目录>/pre-cache.log；传 none 关闭文件日志")
-		maxErrRate  = flag.Float64("max-error-rate", 0, "错误率超过该百分比时以退出码 3 结束，0 表示不检查")
-		showVersion = flag.Bool("version", false, "显示版本号后退出")
-		debug       = flag.Bool("debug", false, "输出调试信息")
+		sitemap       = flag.String("sitemap", "", "网站地图地址 (必需)")
+		size          = flag.Int("size", 1, "并发数量，默认 1；动态站优先保持单并发")
+		timeout       = flag.Int("timeout", 10, "单请求超时（秒），默认 10")
+		delay         = flag.Int("delay", 0, "每个并发槽两次请求之间的额外间隔（毫秒），默认 0；通常由 -rate 控制节奏")
+		rate          = flag.Float64("rate", 2, "全局 QPS 上限，默认 2；0 表示完全不限制（不建议，容易压垮源站）")
+		retries       = flag.Int("retry", 2, "失败重试次数（429/408/502/503/504 及网络错误），默认 2")
+		maxFail       = flag.Int("max-fail", 20, "连续多少个请求失败后熔断中止，默认 20；0 关闭熔断")
+		slowRatio     = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
+		slowThreshold = flag.Duration("slow-threshold", 2*time.Second, "慢页面榜单的耗时阈值，默认 2s；与超时排除无关")
+		limit         = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
+		exclude       = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
+		noLearn       = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：连续 3 天超时才记入 slow-pages.txt 并在下次运行时排除）")
+		learnFile     = flag.String("learn-file", "", "毒页面学习文件路径，默认 <程序目录>/slow-pages.txt")
+		host          = flag.String("host", "", "指定真实主机，例如 127.0.0.1:8080（会同时改写 Host 头）")
+		cacheHeader   = flag.String("cacheheader", "", "缓存标识头，例如 x-cache / cf-cache-status")
+		userAgent     = flag.String("useragent", "", "指定 UA，默认模拟 Chrome 浏览器")
+		verify        = flag.Bool("verify", false, "是否校验 SSL 证书，默认 false（不校验）")
+		head          = flag.Bool("head", false, "使用 HEAD 请求预热（省流量，但部分 CDN 只缓存 GET）")
+		recheck       = flag.Duration("recheck", 0, "预热后等待该时长再复检，例如 30s / 2m；0 表示不复检")
+		lastMod       = flag.Duration("lastmod", 0, "只预热 sitemap 中最近该时长内变更的页面，例如 24h；0 表示全部")
+		jsonPath      = flag.String("json", "", "将结果写入 JSON 文件，便于接入监控")
+		logPath       = flag.String("log", "", "日志文件路径，默认 <程序目录>/pre-cache.log；传 none 关闭文件日志")
+		maxErrRate    = flag.Float64("max-error-rate", 0, "错误率超过该百分比时以退出码 3 结束，0 表示不检查")
+		showVersion   = flag.Bool("version", false, "显示版本号后退出")
+		debug         = flag.Bool("debug", false, "输出调试信息")
 	)
 	flag.Parse()
 
@@ -1771,29 +1896,30 @@ func main() {
 	}
 
 	cfg := Config{
-		Sitemap:     *sitemap,
-		Host:        *host,
-		CacheHeader: *cacheHeader,
-		UserAgent:   *userAgent,
-		Concurrency: *size,
-		Timeout:     time.Duration(*timeout) * time.Second,
-		Delay:       time.Duration(*delay) * time.Millisecond,
-		Rate:        *rate,
-		Retries:     *retries,
-		UseHead:     *head,
-		Insecure:    *verify,
-		Debug:       *debug,
-		Recheck:     *recheck,
-		LastMod:     *lastMod,
-		JSONPath:    *jsonPath,
-		LogPath:     logTarget,
-		MaxErrRate:  *maxErrRate,
-		Limit:       *limit,
-		MaxFail:     *maxFail,
-		SlowRatio:   *slowRatio,
-		Exclude:     excl,
-		NoLearn:     *noLearn,
-		LearnPath:   learnPath,
+		Sitemap:       *sitemap,
+		Host:          *host,
+		CacheHeader:   *cacheHeader,
+		UserAgent:     *userAgent,
+		Concurrency:   *size,
+		Timeout:       time.Duration(*timeout) * time.Second,
+		Delay:         time.Duration(*delay) * time.Millisecond,
+		Rate:          *rate,
+		Retries:       *retries,
+		UseHead:       *head,
+		Insecure:      *verify,
+		Debug:         *debug,
+		Recheck:       *recheck,
+		LastMod:       *lastMod,
+		JSONPath:      *jsonPath,
+		LogPath:       logTarget,
+		MaxErrRate:    *maxErrRate,
+		Limit:         *limit,
+		MaxFail:       *maxFail,
+		SlowRatio:     *slowRatio,
+		SlowThreshold: *slowThreshold,
+		Exclude:       excl,
+		NoLearn:       *noLearn,
+		LearnPath:     learnPath,
 	}
 
 	pc, err := NewPreCache(cfg, out)

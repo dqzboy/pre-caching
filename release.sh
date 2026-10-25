@@ -11,12 +11,15 @@ fi
 
 echo "版本: $VERSION"
 
-UNFMT="$(gofmt -l main.go)"
+UNFMT="$(gofmt -l main.go main_test.go)"
 if [[ -n "$UNFMT" ]]; then
-    echo "错误: main.go 未格式化，先执行 gofmt -w main.go" >&2
+    echo "错误: Go 文件未格式化，先执行 gofmt -w main.go main_test.go" >&2
     exit 1
 fi
-go vet main.go
+go vet main.go main_test.go
+go test -race -cover main.go main_test.go
+bash -n run_precache.sh release.sh
+bash tests/run_precache_test.sh
 
 mkdir -p dist
 
