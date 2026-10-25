@@ -738,42 +738,141 @@ func (pc *PreCache) loadLearned() []string {
 	return pats
 }
 
-// saveLearned 把本次超时的页面追加进学习文件（按 RawURL 去重）。
-// 下次运行 loadLearned 会把它们合并进排除列表，工具就"记住"了毒页面。
+const slowPageDays = 3
+
+// slowPageHistory 按本机自然日观察同一个 RawURL；Days=0 表示当天已正常响应，
+// 后续同一天的偶发超时不能再把它算成持续超时的一天。
+type slowPageHistory struct {
+	LastDate string `json:"last_date"`
+	Days     int    `json:"days"`
+}
+
+// saveLearned 只有连续 slowPageDays 天超时才加入排除文件。
+// 观察记录独立持久化，跨进程保留，同一天运行多次也只计一天。
 func (pc *PreCache) saveLearned(results []Result) {
+	pc.saveLearnedAt(results, time.Now())
+}
+
+func (pc *PreCache) saveLearnedAt(results []Result, now time.Time) {
 	if pc.cfg.LearnPath == "" || pc.cfg.NoLearn {
 		return
 	}
-	var urls []string
+	historyPath := pc.cfg.LearnPath + ".history.json"
+	history := map[string]slowPageHistory{}
+	data, err := os.ReadFile(historyPath)
+	if err == nil {
+		if err := json.Unmarshal(data, &history); err != nil || history == nil {
+			pc.out.Warn("无法解析慢页面观察记录 %s，本次不更新学习文件", historyPath)
+			return
+		}
+	} else if !os.IsNotExist(err) {
+		pc.out.Warn("无法读取慢页面观察记录 %s：%v", historyPath, err)
+		return
+	}
+
+	today := now.Format(time.DateOnly)
+	yesterday := now.AddDate(0, 0, -1).Format(time.DateOnly)
+	for u, h := range history {
+		if h.LastDate != today && h.LastDate != yesterday {
+			delete(history, u)
+		}
+	}
+
+	// 同一批结果若有重复 URL，以正常响应为准；取消、未执行和其他网络错误
+	// 都不是页面恢复正常的证据，也不能累计超时天数。
+	observed := map[string]bool{} // true：超时；false：当天有正常响应
 	for _, r := range results {
-		if r.Timeout {
-			urls = append(urls, r.Page.RawURL)
+		if r.Page.RawURL == "" || (!r.Timeout && r.Status == 0) {
+			continue
+		}
+		previous, seen := observed[r.Page.RawURL]
+		observed[r.Page.RawURL] = r.Timeout && (!seen || previous)
+	}
+	for u, timeout := range observed {
+		h := history[u]
+		if !timeout {
+			history[u] = slowPageHistory{LastDate: today}
+			continue
+		}
+		if h.LastDate != today {
+			if h.LastDate != yesterday {
+				h.Days = 0
+			}
+			h.LastDate = today
+			h.Days++
+			history[u] = h
+		}
+	}
+	// 没有历史也没有有效观察时，不创建文件。
+	if len(history) == 0 && os.IsNotExist(err) {
+		return
+	}
+	if err := writeSlowPageHistory(historyPath, history); err != nil {
+		pc.out.Warn("无法保存慢页面观察记录 %s：%v", historyPath, err)
+		return
+	}
+
+	existing := map[string]bool{}
+	data, err = os.ReadFile(pc.cfg.LearnPath)
+	if err != nil && !os.IsNotExist(err) {
+		pc.out.Warn("无法读取毒页面学习文件 %s：%v", pc.cfg.LearnPath, err)
+		return
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		existing[strings.TrimSpace(line)] = true
+	}
+	var urls []string
+	for u, timeout := range observed {
+		if !timeout || existing[u] {
+			continue
+		}
+		h := history[u]
+		if h.Days >= slowPageDays {
+			urls = append(urls, u)
+		} else if h.Days > 0 {
+			pc.out.Muted("慢页面观察：%s（连续超时 %d/%d 天，暂不排除）", u, h.Days, slowPageDays)
 		}
 	}
 	if len(urls) == 0 {
 		return
 	}
-	existing := ""
-	if data, err := os.ReadFile(pc.cfg.LearnPath); err == nil {
-		existing = string(data)
+	sort.Strings(urls)
+	// 兼容已有文件末行没有换行的情况，避免拼接成一个无效 URL。
+	prefix := ""
+	if len(data) > 0 && data[len(data)-1] != '\n' {
+		prefix = "\n"
 	}
 	f, err := os.OpenFile(pc.cfg.LearnPath, os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
 	if err != nil {
-		pc.out.Muted("无法写入毒页面学习文件 %s：%v", pc.cfg.LearnPath, err)
+		pc.out.Warn("无法写入毒页面学习文件 %s：%v", pc.cfg.LearnPath, err)
 		return
 	}
-	defer f.Close()
-	added := 0
-	for _, u := range urls {
-		if strings.Contains(existing, u+"\n") || strings.TrimSpace(existing) == u {
-			continue
-		}
-		fmt.Fprintf(f, "%s\n", u)
-		added++
+	_, writeErr := f.WriteString(prefix + strings.Join(urls, "\n") + "\n")
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		pc.out.Warn("无法写入毒页面学习文件 %s：%v", pc.cfg.LearnPath, err)
+		return
 	}
-	if added > 0 {
-		pc.out.Muted("已将 %d 个超时页面记入 %s，下次运行自动排除", added, pc.cfg.LearnPath)
+	pc.out.Muted("已将连续 %d 天超时的 %d 个页面记入 %s，下次运行自动排除", slowPageDays, len(urls), pc.cfg.LearnPath)
+}
+
+// 先写临时文件再替换，避免中断写入导致观察记录被截断。
+func writeSlowPageHistory(path string, history map[string]slowPageHistory) error {
+	data, err := json.MarshalIndent(history, "", "  ")
+	if err != nil {
+		return err
 	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".slow-pages-history-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	_, writeErr := f.Write(append(data, '\n'))
+	closeErr := f.Close()
+	if err := errors.Join(writeErr, closeErr); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 // ---------------------------------------------------------------------------
@@ -1296,7 +1395,7 @@ func (pc *PreCache) printSlowest(results []Result) {
 		}
 		mark := ""
 		if r.Timeout {
-			mark = "  ← 超时，已记入 " + filepath.Base(pc.cfg.LearnPath) + "，下次自动排除"
+			mark = "  ← 超时"
 		}
 		pc.out.Warn("  %8v  %s%s", r.Elapsed.Round(10*time.Millisecond), r.Page.RawURL, mark)
 	}
@@ -1461,13 +1560,13 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	pc.out.Info("SSL 校验：%v", pc.cfg.Insecure)
 	pc.out.Info("UA  标识：%s", pc.cfg.UserAgent)
 	if !pc.cfg.NoLearn && pc.cfg.LearnPath != "" {
-		pc.out.Info("毒页面学习：%s（超时页面自动排除，-no-learn 关闭）", pc.cfg.LearnPath)
+		pc.out.Info("毒页面学习：%s（连续 %d 天超时才自动排除，-no-learn 关闭）", pc.cfg.LearnPath, slowPageDays)
 	}
 	pc.out.Hint("预缓存开始:")
 	pc.out.Info("---------------------------------------------------------")
 
 	// 合并历史毒页面：把 slow-pages.txt 里的 URL 子串并入排除列表。
-	// 效果是跑一次之后工具自己就学会绕开毒页面，不用每次手动配 EXCLUDE。
+	// 这里只加载已经确认的页面，观察中的页面继续正常预热。
 	if learned := pc.loadLearned(); len(learned) > 0 {
 		pc.cfg.Exclude = append(pc.cfg.Exclude, learned...)
 		pc.out.Muted("已从学习文件加载 %d 个历史超时页面（本次自动排除）", len(learned))
@@ -1488,8 +1587,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	}
 	pc.out.Ok("提取网址成功，共 %d 条（已去重）", len(pages))
 
-	// 毒页面过滤：单个请求就超时的页面（后台聚合页、需要登录的页面等）
-	// 不值得预热，还会在超时期间白占源站的 PHP 进程。
+	// 过滤手动排除和已经确认连续多天超时的页面。
 	if len(pc.cfg.Exclude) > 0 {
 		kept := pages[:0]
 		excluded := []string{}
@@ -1573,7 +1671,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		}
 	}
 
-	// 毒页面自动学习：把本次超时的 URL 记入 slow-pages.txt，下次自动排除
+	// 更新每日观察记录，连续多天超时的 URL 才记入 slow-pages.txt。
 	pc.saveLearned(results)
 
 	if pc.cfg.JSONPath != "" {
@@ -1612,7 +1710,7 @@ func main() {
 		slowRatio   = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
 		limit       = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
 		exclude     = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
-		noLearn     = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：超时页面自动记入 slow-pages.txt 并在下次运行时排除）")
+		noLearn     = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：连续 3 天超时才记入 slow-pages.txt 并在下次运行时排除）")
 		learnFile   = flag.String("learn-file", "", "毒页面学习文件路径，默认 <程序目录>/slow-pages.txt")
 		host        = flag.String("host", "", "指定真实主机，例如 127.0.0.1:8080（会同时改写 Host 头）")
 		cacheHeader = flag.String("cacheheader", "", "缓存标识头，例如 x-cache / cf-cache-status")
