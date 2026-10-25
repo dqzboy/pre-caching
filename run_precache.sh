@@ -3,7 +3,7 @@
 # 预缓存执行脚本（供 cron / systemd timer 调用）
 #
 # 所有参数都可用环境变量覆盖，例如：
-#   SITEMAP_URL="https://blog.example.com/sitemap.xml" CONCURRENCY=8 ./run_precache.sh
+#   SITEMAP_URL="https://blog.example.com/sitemap.xml" CONCURRENCY=1 ./run_precache.sh
 #
 
 set -uo pipefail
@@ -25,7 +25,7 @@ if [[ -f "$ENV_FILE" ]]; then
     _PRESET=()
     for _v in SITEMAP_URL CACHE_HEADER CONCURRENCY TIMEOUT DELAY RATE RETRY RECHECK \
               LASTMOD JSON_OUT MAX_ERROR_RATE VERIFY_SSL EXTRA_ARGS LOG_FILE CRON_LOG \
-              MAX_FAIL SLOW_RATIO SLOW_THRESHOLD LIMIT EXCLUDE NO_LEARN LEARN_FILE \
+              MAX_FAIL SLOW_RATIO SLOW_THRESHOLD MAX_LATENCY COOLDOWN MAX_SLOW REST_RATIO LIMIT EXCLUDE NO_LEARN LEARN_FILE \
               LOG_MAX_BYTES LOCK_FILE; do
         [[ "${!_v+x}" == x ]] && _PRESET+=("${_v}=${!_v}")
     done
@@ -50,12 +50,16 @@ SITEMAP_URL="${SITEMAP_URL:-https://yoursite.com/sitemap.xml}"
 CACHE_HEADER="${CACHE_HEADER-x-cache}"      # 显式留空则不统计缓存状态
 CONCURRENCY="${CONCURRENCY:-1}"             # 动态站默认单并发
 TIMEOUT="${TIMEOUT:-10}"                    # 单请求超时（秒）
-DELAY="${DELAY:-0}"                         # 额外请求间隔（毫秒），默认交给全局限速
-RATE="${RATE:-}"                           # 全局 QPS 上限：留空=用程序默认(2)，显式设 0=完全不限速
-RETRY="${RETRY:-2}"                         # 失败重试次数
-MAX_FAIL="${MAX_FAIL:-}"                    # 连续失败多少个请求后熔断：留空=程序默认(20)，0=关闭熔断
+DELAY="${DELAY:-1000}"                      # 请求完成后全局最小休息（毫秒）
+RATE="${RATE:-}"                           # 全局 QPS 上限：留空=用程序默认(1)，显式设 0=完全不限速
+RETRY="${RETRY:-1}"                         # 失败重试次数
+MAX_FAIL="${MAX_FAIL:-}"                    # 连续失败多少个请求后熔断：留空=程序默认(3)，0=关闭熔断
 SLOW_RATIO="${SLOW_RATIO:-}"                # 耗时超基线多少倍自动降并发：留空=程序默认(3)，0=关闭
 SLOW_THRESHOLD="${SLOW_THRESHOLD:-2s}"      # 慢页面榜单阈值，与超时学习和自适应降速无关
+MAX_LATENCY="${MAX_LATENCY:-3s}"            # 达到此耗时后全局冷却；0 关闭慢响应和超时保护
+COOLDOWN="${COOLDOWN:-10s}"                 # 每次慢响应后全局休息
+MAX_SLOW="${MAX_SLOW:-3}"                   # 连续慢响应中止阈值；首次超时立即中止
+REST_RATIO="${REST_RATIO:-1}"               # 非 HIT 完成后按请求耗时倍数休息
 LIMIT="${LIMIT:-}"                          # 只处理前 N 个页面（灰度试跑）：留空=全部
 EXCLUDE="${EXCLUDE:-}"                     # 排除 URL 包含这些子串的页面，逗号分隔，例如 /ads,/members
 NO_LEARN="${NO_LEARN:-0}"                  # 1=关闭毒页面自动学习（默认开启）
@@ -132,7 +136,7 @@ chmod +x "$EXECUTABLE" 2>/dev/null
 # 用 -version 的输出来判定，而不是解析 -h 的 usage 文本：
 #   - 解析 usage 依赖参数名，参数一改就失效
 #   - `cmd | grep -q` 在 pipefail 下可能因 SIGPIPE 误判为失败
-# 脚本会传 -slow-threshold 等 v2.6 才有的参数，旧版二进制遇到未知参数
+# 脚本会传 -max-latency 等 v2.7 才有的参数，旧版二进制遇到未知参数
 # 只会打一行 "flag provided but not defined" 然后退出 2，很难定位。
 # ---------------------------------------------------------------------------
 VERSION_LINE="$("$EXECUTABLE" -version 2>&1 || true)"
@@ -143,7 +147,7 @@ version_supported() {
     if [[ "$VERSION_LINE" =~ ^pre-caching\ ([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
         major="${BASH_REMATCH[1]}"
         minor="${BASH_REMATCH[2]}"
-        (( 10#$major > 2 || (10#$major == 2 && 10#$minor >= 6) ))
+        (( 10#$major > 2 || (10#$major == 2 && 10#$minor >= 7) ))
         return $?
     fi
     return 1
@@ -152,15 +156,15 @@ version_supported() {
 if ! version_supported; then
     FILE_INFO="$(ls -l "$EXECUTABLE" 2>/dev/null | awk '{print $5" 字节, 修改时间 "$6" "$7" "$8}')"
     cat >&2 <<EOF
-错误: $EXECUTABLE 版本过旧或格式无效，当前脚本需要 v2.6.0 及以上版本
+错误: $EXECUTABLE 版本过旧或格式无效，当前脚本需要 v2.7.0 及以上版本
       -version 实际输出: ${VERSION_LINE:-<空>}
       文件信息: ${FILE_INFO:-<无法读取>}
       文件类型: $(file -b "$EXECUTABLE" 2>/dev/null | cut -c1-60)
 
-      当前脚本使用 -slow-threshold，需要 pre-caching v2.6.0 及以上版本。请在部署目录下执行：
+      当前脚本使用 -max-latency 等压力保护参数，需要 pre-caching v2.7.0 及以上版本。请在部署目录下执行：
 
         ls -l $EXECUTABLE
-        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching 2.6.0 或更新版本
+        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching 2.7.0 或更新版本
 
       若上面显示的还是旧内容，说明上传没有覆盖成功（常见原因：上传到了
       另一个目录、文件名不一致、或旧进程仍占用文件）。重新编译并上传：
@@ -258,6 +262,10 @@ ARGS=(
     --retry="$RETRY"
     --log="$LOG_FILE"
     --slow-threshold="$SLOW_THRESHOLD"
+    --max-latency="$MAX_LATENCY"
+    --cooldown="$COOLDOWN"
+    --max-slow="$MAX_SLOW"
+    --rest-ratio="$REST_RATIO"
     --learn-file="$LEARN_FILE"
 )
 
@@ -297,7 +305,7 @@ echo "预缓存任务结束: $(date '+%F %T')，退出码: $EXIT_CODE"
 case "$EXIT_CODE" in
     0)   ;;
     3)   echo "警告: 首轮或复检的服务不可用率超过阈值，请检查 5xx / 429 / 超时" ;;
-    4)   echo "警告: 已触发熔断（连续失败过多），目标站点疑似过载，请降低 CONCURRENCY / RATE 后重试" ;;
+    4)   echo "警告: 已触发压力保护（超时 / 连续慢响应 / 连续失败），请先确认网站和 PHP 请求恢复，勿立即重跑" ;;
     130) echo "提示: 任务被信号中断" ;;
     *)   echo "错误: 任务异常退出" ;;
 esac

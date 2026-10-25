@@ -35,7 +35,7 @@ import (
 
 // version 版本号。run_precache.sh 会通过 -version 输出判断二进制是否过旧，
 // 因此修改版本号输出格式时请同步检查脚本的版本自检逻辑。
-const version = "2.6.0"
+const version = "2.7.0"
 
 // 预缓存的目标是"像真实访客那样把页面打进缓存"，所以默认请求头按浏览器构造：
 //   - UA 用常见浏览器串：大量 WAF / Bot 管理（Cloudflare SBFM、云厂商 WAF、
@@ -215,6 +215,10 @@ type Config struct {
 	Limit         int           // 只处理前 N 个页面（灰度），0 表示全部
 	MaxFail       int           // 连续失败多少个请求后熔断，0 表示关闭熔断
 	SlowRatio     float64       // 平均耗时超过基线的多少倍就自动降速，0 表示关闭
+	MaxLatency    time.Duration // 单次响应达到此值就休息；0 关闭慢响应/超时保护
+	Cooldown      time.Duration // 慢响应后全局冷却时长
+	MaxSlow       int           // 连续慢响应达到此数时中止；超时立即中止
+	RestRatio     float64       // 非 HIT 请求完成后按耗时倍数全局休息
 	SlowThreshold time.Duration // 慢页面榜单阈值，与超时学习、自适应降速无关
 	Exclude       []string      // 排除 URL 包含这些子串的页面（毒页面过滤）
 	NoLearn       bool          // 关闭毒页面自动学习
@@ -260,8 +264,13 @@ type PreCache struct {
 	// 熔断相关：目标站点一旦整体不可用，继续跑只会把源站踩得更死。
 	// consecFail 记录"连续"失败数，中间只要成功一次就清零。
 	consecFail int64
-	tripped    int32              // 是否已触发熔断（原子 CAS）
+	tripped    int32              // 是否已触发压力保护
 	cancel     context.CancelFunc // 由 Start 注入，用于主动中止
+
+	pressureMu sync.Mutex
+	pauseUntil time.Time
+	slowStreak int
+	stopReason string
 }
 
 func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
@@ -284,6 +293,12 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 	}
 	if math.IsNaN(cfg.MaxErrRate) || math.IsInf(cfg.MaxErrRate, 0) || cfg.MaxErrRate < 0 || cfg.MaxErrRate > 100 {
 		return nil, fmt.Errorf("-max-error-rate 必须在 0 到 100 之间")
+	}
+	if cfg.MaxLatency < 0 || cfg.Cooldown < 0 || cfg.MaxSlow < 0 {
+		return nil, fmt.Errorf("-max-latency、-cooldown 和 -max-slow 必须非负")
+	}
+	if math.IsNaN(cfg.RestRatio) || math.IsInf(cfg.RestRatio, 0) || cfg.RestRatio < 0 || cfg.RestRatio > 100 {
+		return nil, fmt.Errorf("-rest-ratio 必须是 0 到 100 之间的有限数字")
 	}
 	if cfg.SlowThreshold < 0 {
 		return nil, fmt.Errorf("-slow-threshold 必须大于 0")
@@ -346,9 +361,14 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 		if len(via) >= 2 {
 			return fmt.Errorf("已跟随 1 次重定向，停止")
 		}
+		// 重定向属于已经发出的尝试，只受 QPS 约束，让在飞请求正常完成。
+		// 在这里等待其他请求触发的冷却，会消耗 http.Client.Timeout 并制造假超时。
 		pc.pacer.wait(req.Context())
 		if err := req.Context().Err(); err != nil {
 			return err
+		}
+		if pc.aborted() {
+			return context.Canceled
 		}
 		atomic.AddInt64(&pc.requests, 1)
 		return nil
@@ -358,8 +378,7 @@ func NewPreCache(cfg Config, out *Printer) (*PreCache, error) {
 
 // 所有网络请求共用同一限速器；重定向由 CheckRedirect 单独领取配额。
 func (pc *PreCache) do(req *http.Request) (*http.Response, error) {
-	pc.pacer.wait(req.Context())
-	if err := req.Context().Err(); err != nil {
+	if err := pc.waitRequest(req.Context()); err != nil {
 		return nil, err
 	}
 	atomic.AddInt64(&pc.requests, 1)
@@ -631,8 +650,7 @@ func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bo
 	}
 
 	// 限速等待不属于页面响应耗时。
-	pc.pacer.wait(ctx)
-	if ctx.Err() != nil {
+	if pc.waitRequest(ctx) != nil {
 		return res, false
 	}
 	start := time.Now()
@@ -645,11 +663,7 @@ func (pc *PreCache) once(ctx context.Context, p Page, method string) (Result, bo
 		res.Class = ClassException
 		res.Err = simplifyErr(err)
 		res.Elapsed = time.Since(start)
-		// 超时不重试：等满整个 -timeout 都没有响应，说明这个页面本身极重
-		// 或源站已经过载，重试只会把源站的 PHP 进程再白占一个超时周期。
-		// 实测重页面 10s × (1+2 次重试) = 单个毒页面拖住一个 PHP 进程 30 秒，
-		// sitemap 末尾几个毒页面足以把小站的进程池耗光——这是"每次跑到
-		// 同一个进度网站就挂"的直接原因。
+		// 客户端超时不代表 PHP 已停止；不重试，并交由压力保护中止后续任务。
 		if isTimeoutErr(err) {
 			res.Timeout = true
 			return res, false
@@ -1149,6 +1163,7 @@ func (t *throttle) reductions() int {
 //
 // 404 不算（sitemap 里有死链是常态），403 不算（可能只是部分页面被 WAF 拦）。
 func (pc *PreCache) noteResult(r Result) {
+	pc.notePressure(r)
 	if pc.cfg.MaxFail <= 0 {
 		return
 	}
@@ -1165,15 +1180,105 @@ func (pc *PreCache) noteResult(r Result) {
 	if n < int64(pc.cfg.MaxFail) {
 		return
 	}
-	// 只让第一个越过阈值的 worker 负责打印和中断，避免所有 worker 同时刷屏
-	if !atomic.CompareAndSwapInt32(&pc.tripped, 0, 1) {
+	pc.stopForPressure(fmt.Sprintf("连续 %d 个请求失败（5xx / 429 / 超时）", n))
+}
+
+// waitRequest 在新尝试发起前检查全局休息时间，重试和复检也不能绕过。
+// QPS 等待完成后再检查：其他在飞请求可能刚刚延长了冷却时间。
+func (pc *PreCache) waitRequest(ctx context.Context) error {
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if pc.aborted() {
+			return context.Canceled
+		}
+		pc.pressureMu.Lock()
+		remaining := time.Until(pc.pauseUntil)
+		pc.pressureMu.Unlock()
+		if remaining > 0 {
+			sleep(ctx, remaining)
+			continue
+		}
+		pc.pacer.wait(ctx)
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		pc.pressureMu.Lock()
+		ready := !time.Now().Before(pc.pauseUntil)
+		pc.pressureMu.Unlock()
+		if ready && !pc.aborted() {
+			return nil
+		}
+		// 等待期间有其他请求触发冷却时，重新领取 QPS 配额，避免冷却结束后突发。
+	}
+}
+
+// notePressure 对每次完成的尝试立即反馈，即使只有一个 worker 或响应为 200。
+func (pc *PreCache) notePressure(r Result) {
+	if r.Class == ClassSkipped {
 		return
 	}
-	pc.out.Err("连续 %d 个请求失败（5xx / 429 / 超时），判定目标站点已不可用，主动中止", n)
-	pc.out.Warn("继续跑只会把源站踩得更死。请先确认站点恢复，再降低 -rate / -size 重试")
+	rest := pc.cfg.Delay
+	if r.Class != ClassHit && pc.cfg.RestRatio > 0 {
+		ns := float64(r.Elapsed) * pc.cfg.RestRatio
+		d := time.Duration(math.MaxInt64)
+		if ns < float64(math.MaxInt64) {
+			d = time.Duration(ns)
+		}
+		if d > rest {
+			rest = d
+		}
+	}
+	slow := pc.cfg.MaxLatency > 0 && (r.Timeout || r.Elapsed >= pc.cfg.MaxLatency)
+	if slow && pc.cfg.Cooldown > rest {
+		rest = pc.cfg.Cooldown
+	}
+
+	pc.pressureMu.Lock()
+	if until := time.Now().Add(rest); until.After(pc.pauseUntil) {
+		pc.pauseUntil = until
+	}
+	if slow {
+		pc.slowStreak++
+	} else {
+		pc.slowStreak = 0
+	}
+	n := pc.slowStreak
+	pc.pressureMu.Unlock()
+
+	if !slow {
+		return
+	}
+	if r.Timeout {
+		pc.stopForPressure(fmt.Sprintf("请求超时：%s；服务端任务可能仍在执行", r.Page.RawURL))
+	} else if pc.cfg.MaxSlow > 0 && n >= pc.cfg.MaxSlow {
+		pc.stopForPressure(fmt.Sprintf("连续 %d 个慢响应（阈值 %v），最近页面 %s", n, pc.cfg.MaxLatency, r.Page.RawURL))
+	} else {
+		pc.out.Warn("  慢响应：%v %s；全局休息 %v（连续 %d 次）", r.Elapsed.Round(time.Millisecond), r.Page.RawURL, rest, n)
+	}
+}
+
+func (pc *PreCache) stopForPressure(reason string) {
+	pc.pressureMu.Lock()
+	if pc.aborted() {
+		pc.pressureMu.Unlock()
+		return
+	}
+	pc.stopReason = reason
+	atomic.StoreInt32(&pc.tripped, 1)
+	pc.pressureMu.Unlock()
+	pc.out.Err("压力保护：%s，主动中止预热", reason)
+	pc.out.Warn("先确认网站和 PHP 请求恢复，再考虑小批量试跑；客户端取消不能保证服务端任务终止")
 	if pc.cancel != nil {
 		pc.cancel()
 	}
+}
+
+func (pc *PreCache) pressureReason() string {
+	pc.pressureMu.Lock()
+	defer pc.pressureMu.Unlock()
+	return pc.stopReason
 }
 
 func (pc *PreCache) aborted() bool {
@@ -1221,16 +1326,7 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			var lastEnd time.Time
 			for idx := range jobs {
-				if runCtx.Err() != nil {
-					return
-				}
-				// 每个 worker 自己控制节奏：两次请求之间至少间隔 delay。
-				// 这段等待不占用任何全局资源，不会挤掉其他 worker 的并发度。
-				if !lastEnd.IsZero() && pc.cfg.Delay > 0 {
-					sleep(runCtx, pc.cfg.Delay-time.Since(lastEnd))
-				}
 				if runCtx.Err() != nil {
 					return
 				}
@@ -1243,7 +1339,6 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 				th.release()
 
 				results[idx] = res
-				lastEnd = time.Now()
 				th.observe(res.Elapsed)
 
 				if progressEvery > 0 {
@@ -1545,6 +1640,7 @@ type jsonReport struct {
 	Requests         int64          `json:"requests"`
 	ExitCode         int            `json:"exit_code"`
 	SlowThresholdSec float64        `json:"slow_threshold_sec"`
+	StopReason       string         `json:"stop_reason,omitempty"`
 }
 
 func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed time.Duration, rc *jsonRecheck, exitCode int) error {
@@ -1571,6 +1667,7 @@ func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed ti
 		Completed:        s.Total - s.Skipped,
 		Requests:         atomic.LoadInt64(&pc.requests),
 		ExitCode:         exitCode,
+		StopReason:       pc.pressureReason(),
 		SlowThresholdSec: pc.cfg.SlowThreshold.Seconds(),
 	}
 	if elapsed > 0 {
@@ -1644,7 +1741,12 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	} else {
 		pc.out.Warn("全局限速：已关闭（-rate=0），压力仅受并发与额外间隔限制，请确认这是你要的")
 	}
-	pc.out.Info("请求间隔：%v（每个并发槽内）", pc.cfg.Delay)
+	pc.out.Info("请求完成后全局最小休息：%v；非 HIT 额外休息：耗时 × %.1f（取两者较大值）", pc.cfg.Delay, pc.cfg.RestRatio)
+	if pc.cfg.MaxLatency > 0 {
+		pc.out.Info("慢响应保护：达到 %v 后全局休息 %v；连续 %d 次中止（0=不按次数中止），首次超时立即中止", pc.cfg.MaxLatency, pc.cfg.Cooldown, pc.cfg.MaxSlow)
+	} else {
+		pc.out.Warn("慢响应/首次超时保护已关闭（-max-latency=0）")
+	}
 	pc.out.Info("超时时间：%v，重试：%d 次", pc.cfg.Timeout, pc.cfg.Retries)
 	if pc.cfg.MaxFail > 0 {
 		pc.out.Info("熔断阈值：连续 %d 个请求失败即中止", pc.cfg.MaxFail)
@@ -1827,11 +1929,15 @@ func main() {
 		sitemap       = flag.String("sitemap", "", "网站地图地址 (必需)")
 		size          = flag.Int("size", 1, "并发数量，默认 1；动态站优先保持单并发")
 		timeout       = flag.Int("timeout", 10, "单请求超时（秒），默认 10")
-		delay         = flag.Int("delay", 0, "每个并发槽两次请求之间的额外间隔（毫秒），默认 0；通常由 -rate 控制节奏")
-		rate          = flag.Float64("rate", 2, "全局 QPS 上限，默认 2；0 表示完全不限制（不建议，容易压垮源站）")
-		retries       = flag.Int("retry", 2, "失败重试次数（429/408/502/503/504 及网络错误），默认 2")
-		maxFail       = flag.Int("max-fail", 20, "连续多少个请求失败后熔断中止，默认 20；0 关闭熔断")
+		delay         = flag.Int("delay", 1000, "请求完成后全局最小休息（毫秒），默认 1000；与非 HIT 按耗时休息取较大值")
+		rate          = flag.Float64("rate", 1, "全局 QPS 上限，默认 1；0 表示完全不限制（不建议，容易压垮源站）")
+		retries       = flag.Int("retry", 1, "失败重试次数（429/408/502/503/504 及网络错误），默认 1；超时不重试")
+		maxFail       = flag.Int("max-fail", 3, "连续多少个请求失败后熔断中止，默认 3；0 关闭熔断")
 		slowRatio     = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
+		maxLatency    = flag.Duration("max-latency", 3*time.Second, "慢响应保护阈值，默认 3s；0 关闭慢响应与首次超时保护")
+		cooldown      = flag.Duration("cooldown", 10*time.Second, "每次慢响应后的全局冷却，默认 10s")
+		maxSlow       = flag.Int("max-slow", 3, "连续慢响应中止阈值，默认 3；0 不按次数中止；超时仍立即中止")
+		restRatio     = flag.Float64("rest-ratio", 1, "非 HIT 请求结束后的全局休息/耗时倍数，默认 1；0 关闭按耗时休息")
 		slowThreshold = flag.Duration("slow-threshold", 2*time.Second, "慢页面榜单的耗时阈值，默认 2s；与超时排除无关")
 		limit         = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
 		exclude       = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
@@ -1916,6 +2022,10 @@ func main() {
 		Limit:         *limit,
 		MaxFail:       *maxFail,
 		SlowRatio:     *slowRatio,
+		MaxLatency:    *maxLatency,
+		Cooldown:      *cooldown,
+		MaxSlow:       *maxSlow,
+		RestRatio:     *restRatio,
 		SlowThreshold: *slowThreshold,
 		Exclude:       excl,
 		NoLearn:       *noLearn,

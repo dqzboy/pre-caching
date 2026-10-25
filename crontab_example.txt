@@ -4,7 +4,8 @@
 # 安装前准备（只需一次）：
 #   1. cp precache.env.example precache.env
 #   2. 改 precache.env 里的 SITEMAP_URL / CACHE_HEADER
-#   3. 手动跑一次确认：/bin/bash /opt/pre-caching/run_precache.sh
+#   3. 小批量确认：LIMIT=10 RECHECK=0 /bin/bash /opt/pre-caching/run_precache.sh
+#      曾发生网站卡顿时先停用预热，恢复并排查 PHP 慢日志后再验证。
 #   4. 安装本文件：crontab crontab_example.txt
 #
 # 站点参数（SITEMAP_URL / CACHE_HEADER 等）配在 precache.env 里，
@@ -20,13 +21,13 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 # 触发时间：每小时的第 5 分钟（00:05、01:05、02:05 …… 一天 24 次）
 #           用 5 而不是 0，是为了避开整点高峰
 # LASTMOD=2h  只预热 sitemap 里 lastmod 在最近 2 小时内变更的页面，
-#             通常只有几篇，压力最小；适合发完文章后快速回温
+#             缺少 lastmod 的页面仍会请求，WordPress 可能因此变成全量；先检查日志。
 # 日志：追加写入 cron.log，超过 5MB 自动轮转为 cron.log.1
 # ---------------------------------------------------------------------------
-5 * * * * LASTMOD=2h /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
+#5 * * * * LASTMOD=2h /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 
 # ---------------------------------------------------------------------------
-# 【每天 03:10 · 全量】
+# 【每天 03:10 · 全量；完成小批量验证后再启用】
 # 触发时间：每天凌晨 3 点 10 分
 # 作用：全部页面刷一遍，兜底。增量只覆盖"最近变更"的页面，
 #       缓存 TTL 到期的老页面没人访问就会一直 MISS，靠这次全量回温
@@ -34,7 +35,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #             复检结果会直接打印"X 个页面中 Y 个已命中"
 # JSON_OUT    把结果写成 JSON，方便接监控或对比历史
 # ---------------------------------------------------------------------------
-10 3 * * * LASTMOD=0 RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
+#10 3 * * * LASTMOD=0 RECHECK=1m JSON_OUT=/opt/pre-caching/last-report.json /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 
 # ===========================================================================
 # 时间格式：分 时 日 月 周
@@ -61,7 +62,7 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #   ✗ 直接跑脚本不加 /bin/bash   依赖文件执行位，scp 传丢权限就 Permission denied
 # ===========================================================================
 # 其他
-#   - 退出码：0 正常 / 1 致命错误 / 3 错误率超阈值 / 4 触发熔断 / 130 被中断
+#   - 退出码：0 正常 / 1 致命错误 / 3 错误率超阈值 / 4 压力保护中止 / 130 被中断
 #   - 脚本自带防重叠锁，上一次没跑完会自动跳过本次，不会叠加压力
 #   - 排查是否真的触发：journalctl -u cron --since today | grep CRON
 # ===========================================================================

@@ -315,6 +315,201 @@ func newTestCache(t *testing.T, cfg Config) *PreCache {
 	t.Cleanup(pc.transport.CloseIdleConnections)
 	return pc
 }
+
+// Reproduce the incident at one worker: successful but expensive PHP pages must
+// cause a real idle period and eventually stop, even without any HTTP errors.
+func TestSerialSlow200CoolsDownAndStops(t *testing.T) {
+	var mu sync.Mutex
+	var starts, ends []time.Time
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		starts = append(starts, time.Now())
+		mu.Unlock()
+		time.Sleep(30 * time.Millisecond)
+		w.Header().Set("X-Cache", "MISS")
+		_, _ = w.Write([]byte("page"))
+		mu.Lock()
+		ends = append(ends, time.Now())
+		mu.Unlock()
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL, CacheHeader: "X-Cache", Concurrency: 1,
+		MaxLatency: 10 * time.Millisecond, Cooldown: 70 * time.Millisecond, MaxSlow: 2})
+	pages := make([]Page, 5)
+	for i := range pages {
+		pages[i] = Page{RawURL: s.URL, URL: s.URL}
+	}
+	results := pc.run(context.Background(), pages)
+	mu.Lock()
+	defer mu.Unlock()
+	if len(starts) != 2 || !pc.aborted() {
+		t.Fatalf("sent %d slow 200 requests, aborted=%v; want 2 and stop", len(starts), pc.aborted())
+	}
+	if gap := starts[1].Sub(ends[0]); gap < 60*time.Millisecond {
+		t.Fatalf("no server recovery period between slow 200s: %v", gap)
+	}
+	stats := summarize(results)
+	if stats.Miss != 2 || stats.Skipped != 3 || pc.pressureReason() == "" {
+		t.Fatalf("lost successful response or stop reason: %+v / %q", stats, pc.pressureReason())
+	}
+}
+
+func TestFirstTimeoutStopsWhileServerKeepsWorking(t *testing.T) {
+	var pages atomic.Int32
+	stillWorking := make(chan struct{})
+	finished := make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/":
+			_, _ = w.Write([]byte("healthy cached root"))
+		case "/sitemap.xml":
+			base := "http://" + r.Host
+			_, _ = fmt.Fprintf(w, "<urlset><url><loc>%s/slow</loc></url><url><loc>%s/next</loc></url></urlset>", base, base)
+		default:
+			pages.Add(1)
+			// Model PHP ignoring client disconnect: keep executing after timeout.
+			<-stillWorking
+			close(finished)
+		}
+	}))
+	defer s.Close()
+	defer close(stillWorking)
+	report := filepath.Join(t.TempDir(), "report.json")
+	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", Timeout: 70 * time.Millisecond,
+		MaxLatency: time.Second, MaxSlow: 3, Retries: 2, Recheck: time.Millisecond, JSONPath: report})
+	code, err := pc.Start(context.Background())
+	if err != nil || code != 4 || pages.Load() != 1 {
+		t.Fatalf("timeout must stop before next page: code=%d err=%v pages=%d", code, err, pages.Load())
+	}
+	select {
+	case <-finished:
+		t.Fatal("test must model work persisting on server after client exit")
+	default:
+	}
+	data, err := os.ReadFile(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var rep jsonReport
+	if err := json.Unmarshal(data, &rep); err != nil {
+		t.Fatal(err)
+	}
+	if rep.ExitCode != 4 || rep.Completed != 1 || rep.Counts["skipped"] != 1 || rep.StopReason == "" || rep.Recheck != nil {
+		t.Fatalf("incomplete pressure stop report: %+v", rep)
+	}
+}
+
+func TestPressureRestAndSlowStreak(t *testing.T) {
+	for _, class := range []Class{ClassHit, ClassMiss, ClassNoHeader, ClassUncacheable, ClassUnclassified} {
+		pc := newTestCache(t, Config{Sitemap: "http://example.com", Delay: 10 * time.Millisecond, RestRatio: 2})
+		start := time.Now()
+		pc.notePressure(Result{Class: class, Elapsed: 50 * time.Millisecond})
+		want := 100 * time.Millisecond
+		if class == ClassHit {
+			want = 10 * time.Millisecond
+		}
+		if got := pc.pauseUntil.Sub(start); got < want || got > want+50*time.Millisecond {
+			t.Fatalf("class %v recovery period=%v want ~%v", class, got, want)
+		}
+	}
+	pc := newTestCache(t, Config{Sitemap: "http://example.com", MaxLatency: time.Second, MaxSlow: 2})
+	slow := Result{Class: ClassMiss, Elapsed: 2 * time.Second}
+	pc.notePressure(slow)
+	pc.notePressure(Result{Class: ClassHit, Elapsed: time.Millisecond})
+	pc.notePressure(slow)
+	pc.notePressure(Result{Class: ClassSkipped, Timeout: true})
+	if pc.aborted() || pc.slowStreak != 1 {
+		t.Fatal("fast responses must reset streak; skipped requests must not affect it")
+	}
+	pc.notePressure(slow)
+	if !pc.aborted() {
+		t.Fatal("second consecutive slow response did not stop")
+	}
+}
+
+func TestCooldownCancellationAndRateAfterResume(t *testing.T) {
+	pc := newTestCache(t, Config{Sitemap: "http://example.com", Rate: 10})
+	pc.pauseUntil = time.Now().Add(80 * time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := pc.waitRequest(ctx); err != context.Canceled {
+		t.Fatalf("cooldown cancellation: %v", err)
+	}
+	var wg sync.WaitGroup
+	ready := make(chan time.Time, 3)
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if pc.waitRequest(context.Background()) == nil {
+				ready <- time.Now()
+			}
+		}()
+	}
+	wg.Wait()
+	close(ready)
+	var prev time.Time
+	for now := range ready {
+		if now.Before(pc.pauseUntil) {
+			t.Fatal("request bypassed global cooldown")
+		}
+		if !prev.IsZero() && now.Sub(prev) < 80*time.Millisecond {
+			t.Fatalf("cooldown resume bypassed QPS: gap %v", now.Sub(prev))
+		}
+		prev = now
+	}
+}
+
+func TestPressureDelayAppliesBeforeRetry(t *testing.T) {
+	var mu sync.Mutex
+	var times []time.Time
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		times = append(times, time.Now())
+		n := len(times)
+		mu.Unlock()
+		if n == 1 {
+			w.WriteHeader(http.StatusServiceUnavailable)
+		}
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL, Delay: 1500 * time.Millisecond, Retries: 1})
+	r := pc.probe(context.Background(), Page{RawURL: s.URL, URL: s.URL})
+	mu.Lock()
+	defer mu.Unlock()
+	if r.Status != 200 || len(times) != 2 || times[1].Sub(times[0]) < 1450*time.Millisecond {
+		t.Fatalf("retry bypassed post-response rest: result=%+v times=%v", r, times)
+	}
+}
+
+func TestInFlightRedirectDoesNotSpendTimeoutOnCooldown(t *testing.T) {
+	started, proceed := make(chan struct{}), make(chan struct{})
+	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/redirect" {
+			close(started)
+			<-proceed
+			http.Redirect(w, r, "/page", http.StatusFound)
+			return
+		}
+		_, _ = w.Write([]byte("page"))
+	}))
+	defer s.Close()
+	pc := newTestCache(t, Config{Sitemap: s.URL, Timeout: 200 * time.Millisecond,
+		MaxLatency: time.Second, Cooldown: time.Second})
+	result := make(chan Result, 1)
+	go func() {
+		r, _ := pc.once(context.Background(), Page{RawURL: s.URL + "/redirect", URL: s.URL + "/redirect"}, http.MethodGet)
+		result <- r
+	}()
+	<-started
+	// A different worker completes a slow request while this one is in flight.
+	pc.notePressure(Result{Class: ClassMiss, Elapsed: time.Second})
+	close(proceed)
+	r := <-result
+	if r.Status != 200 || r.Timeout || r.Elapsed >= pc.cfg.Timeout {
+		t.Fatalf("local cooldown caused a false upstream timeout on redirect: %+v", r)
+	}
+}
 func TestResponseBodyTimeout(t *testing.T) {
 	s := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache", "HIT")

@@ -19,7 +19,7 @@ SH
 cat > "$FIXTURE/dist/pre-caching-amd64" <<'SH'
 #!/usr/bin/env bash
 if [[ "${1-}" == -version ]]; then
-    echo "pre-caching ${FAKE_VERSION:-2.6.0}"
+    echo "pre-caching ${FAKE_VERSION:-2.7.0}"
     exit 0
 fi
 printf '%s\n' "$@" > "$CAPTURE_ARGS"
@@ -44,6 +44,10 @@ cat > "$ENV_FILE" <<'SH'
 CACHE_HEADER=x-cache
 SLOW_THRESHOLD=3s
 LEARN_FILE=/configured/slow-pages.txt
+MAX_LATENCY=4s
+COOLDOWN=20s
+MAX_SLOW=2
+REST_RATIO=2
 SH
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -57,10 +61,14 @@ contains_arg() {
 run_script() { bash "$FIXTURE/run_precache.sh"; }
 
 # Linux 应能从 dist 找到二进制；显式空字符串应覆盖配置文件。
-CACHE_HEADER= SLOW_THRESHOLD=5s LEARN_FILE="$FIXTURE/custom slow.txt" run_script > "$TEST_ROOT/output" 2>&1
+MAX_LATENCY=3s COOLDOWN=10s MAX_SLOW=3 REST_RATIO=1 CACHE_HEADER= SLOW_THRESHOLD=5s LEARN_FILE="$FIXTURE/custom slow.txt" run_script > "$TEST_ROOT/output" 2>&1
 contains_arg --cacheheader= || fail "empty CACHE_HEADER override lost"
 contains_arg --size=1 || fail "safe concurrency default lost"
-contains_arg --delay=0 || fail "unnecessary per-page delay restored"
+contains_arg --delay=1000 || fail "post-response rest default lost"
+contains_arg --max-latency=3s || fail "latency protection default lost"
+contains_arg --cooldown=10s || fail "cooldown default lost"
+contains_arg --max-slow=3 || fail "slow stop default lost"
+contains_arg --rest-ratio=1 || fail "cold request rest default lost"
 contains_arg --slow-threshold=5s || fail "slow threshold override lost"
 contains_arg "--learn-file=$FIXTURE/custom slow.txt" || fail "learn path with spaces lost"
 
@@ -68,9 +76,13 @@ contains_arg "--learn-file=$FIXTURE/custom slow.txt" || fail "learn path with sp
 run_script > "$TEST_ROOT/output" 2>&1
 contains_arg --cacheheader=x-cache || fail "cache header configuration lost"
 contains_arg --slow-threshold=3s || fail "slow threshold configuration lost"
+contains_arg --max-latency=4s || fail "latency configuration lost"
+contains_arg --cooldown=20s || fail "cooldown configuration lost"
+contains_arg --max-slow=2 || fail "slow stop configuration lost"
+contains_arg --rest-ratio=2 || fail "rest ratio configuration lost"
 
 # 拒绝缺少新参数的旧二进制，支持后续主版本。
-if FAKE_VERSION=2.5.0 run_script > "$TEST_ROOT/output" 2>&1; then
+if FAKE_VERSION=2.6.0 run_script > "$TEST_ROOT/output" 2>&1; then
     fail "outdated binary accepted"
 fi
 FAKE_VERSION=3.0.0 run_script > "$TEST_ROOT/output" 2>&1

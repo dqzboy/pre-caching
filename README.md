@@ -14,9 +14,11 @@
 ### 技术特点
 - **连接复用**：完整读取响应体，keep-alive 连接会被复用，不再每个页面重新握手
 - **固定 worker 池**：并发数固定，不会因 URL 数量膨胀而创建海量 goroutine
-- **全局限速**：`-rate` 控制实际 HTTP 请求的整体 QPS（默认 2），健康检查、sitemap、重试和重定向均计入配额
+- **全局限速**：`-rate` 控制实际 HTTP 请求的整体 QPS（默认 1），健康检查、sitemap、重试和重定向均计入配额
 - **过载熔断**：连续 N 次请求尝试失败（5xx / 429 / 网络异常）自动中止，重试也计数，避免把已经扛不住的源站踩死
-- **自适应降速**：源站响应变慢时自动收窄并发（最低降到 1），覆盖"站还能访问、只是越来越卡"这种熔断管不到的情况
+- **慢响应保护**：响应达到 3s 后全局冷却 10s，连续 3 次慢响应或首次超时立即中止；单并发也生效
+- **按耗时休息**：非 HIT 请求完成后，默认休息与请求耗时相同的时间，且每次预热请求后至少休息 1s
+- **自适应降速**：源站响应变慢时自动收窄并发（最低降到 1）；单并发的恢复时间由全局休息和慢响应保护提供
 - **毒页面自动学习**：同一链接连续 3 个自然日超时才记入 `slow-pages.txt`，下次运行按完整 URL 精确排除，避免偶发慢请求和相似路径被误伤
 - **预热前健康检查**：开工前先探一次源站，已故障或响应过慢就直接退出，不往故障上压请求
 - **慢页面报告**：统计里直接列出最慢的页面 Top 5（并写入 JSON），毒页面一眼可见，不用翻日志猜
@@ -36,7 +38,8 @@
 
 ### 2. 并发请求处理
 - 固定 `-size` 个 worker 消费任务队列，结果按索引写回，顺序稳定
-- 每个 worker 在两次请求之间保持 `-delay` 间隔，该等待不占用全局并发资源
+- 每次预热尝试完成后，全局休息至少 `-delay`；非 HIT 还按 `-rest-ratio × 请求耗时` 休息，取较大值
+- 慢响应后再与 `-cooldown` 取较大值；等待可取消，重试和复检也遵守，冷却结束仍受 QPS 限制；在飞请求及其重定向可完成，重定向仍计入 QPS
 - 可选 `-rate` 作为全局 QPS 上限，所有 worker、重试和重定向共享同一个令牌间隔
 
 ### 3. 缓存状态判定
@@ -74,7 +77,7 @@ GOOS=linux GOARCH=arm64 go build -o pre-caching-arm64 main.go
 
 ```bash
 ./release.sh
-# 版本: 2.6.0
+# 版本: 2.7.0
 #   dist/pre-caching-amd64   6.3M
 #   dist/pre-caching-arm64   5.8M
 ```
@@ -111,7 +114,7 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 
 > **二进制和脚本必须一起更新**，否则会出现"脚本传了新参数、二进制不认识"的情况：
 > `flag provided but not defined: -retry`。
-> `run_precache.sh` 会做版本自检，二进制低于 v2.6.0 时直接给出明确提示，不会等到传入新参数后才失败。
+> `run_precache.sh` 会做版本自检，二进制低于 v2.7.0 时直接给出明确提示，不会等到传入新参数后才失败。
 
 ## 使用示例
 
@@ -122,12 +125,12 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 # 首次上线：只跑 20 页、单并发，确认源站扛得住再放开
 ./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
               -cacheheader="x-cache" \
-              -limit=20 -size=1 -rate=2
+              -limit=10 -size=1 -rate=1
 
-# 生产推荐：预热 + 复检 + JSON 报告
+# 小批量验证稳定后：预热 + 可选复检 + JSON 报告
 ./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
               -cacheheader="cf-cache-status" \
-              -size=2 -rate=4 \
+              -size=1 -rate=1 \
               -recheck=2m \
               -json=/var/log/precache/report.json
 
@@ -135,13 +138,13 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 ./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
               -host="10.0.0.5:80" -verify=false
 
-# 只预热最近 24 小时变更的页面（增量，压力最小）
+# 只预热最近 24 小时变更的页面（缺少 lastmod 的页面仍会请求）
 ./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
               -cacheheader="x-cache" -lastmod=24h
 
 # 精确定速：全局 20 QPS（纯静态站才这么激进，动态站别用）
 ./pre-caching -sitemap="https://yoursite.com/sitemap.xml" \
-              -cacheheader="x-cache" -size=8 -delay=0 -rate=20
+              -cacheheader="x-cache" -size=8 -delay=0 -rest-ratio=0 -rate=20
 
 # 查看帮助
 ./pre-caching -h
@@ -153,9 +156,13 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 |------|--------|------|
 | `-sitemap` | 必填 | sitemap 地址，支持 `<urlset>` 与 `<sitemapindex>` |
 | `-size` | 1 | 并发 worker 数量（上限 512） |
-| `-delay` | 0 | 每个 worker 两次请求之间的额外间隔（毫秒）；默认由全局 `-rate` 控制节奏 |
-| `-rate` | 2 | 全局 QPS 上限，**0 表示完全不限制**（不建议） |
-| `-max-fail` | 20 | 连续多少次 HTTP 请求尝试失败后熔断中止，重试计数；0 关闭熔断 |
+| `-delay` | 1000 | 每次预热请求完成后的全局最小休息（毫秒），重试也遵守 |
+| `-rate` | 1 | 全局 QPS 上限，**0 表示完全不限制**（不建议） |
+| `-max-fail` | 3 | 连续多少次 HTTP 请求尝试失败后熔断中止，重试计数；0 关闭熔断 |
+| `-rest-ratio` | 1 | 非 HIT 请求后的休息/耗时倍数，与 `-delay` 取较大值；0 关闭按耗时休息 |
+| `-max-latency` | 3s | 慢响应阈值；0 关闭慢响应和首次超时保护 |
+| `-cooldown` | 10s | 每次慢响应后的全局冷却，与常规休息取较大值 |
+| `-max-slow` | 3 | 连续慢响应达到此数后停止；0 不按次数停止；首次超时仍立即停止 |
 | `-slow-ratio` | 3 | 平均耗时超过基线的多少倍时自动降并发，0 关闭自适应 |
 | `-slow-threshold` | 2s | 控制台 Top 5 和 JSON Top 10 的慢页面阈值，例如 `3s` / `500ms`；超时始终列出，不影响自动学习或自适应降速 |
 | `-limit` | 0 | 只处理 sitemap 中的前 N 个页面（灰度试跑），0 全部 |
@@ -163,7 +170,7 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | `-no-learn` | false | 关闭毒页面自动学习（默认连续 3 天超时才自动排除） |
 | `-learn-file` | 程序目录/slow-pages.txt | 已确认的排除文件路径；观察记录保存为同路径加 `.history.json` |
 | `-timeout` | 10 | 单请求超时（秒） |
-| `-retry` | 2 | 429/408/502/503/504 与网络错误的重试次数 |
+| `-retry` | 1 | 429/408/502/503/504 与网络错误的重试次数 |
 | `-host` | 空 | 指定真实主机（如 `127.0.0.1:8080`），同时改写 Host 头 |
 | `-cacheheader` | 空 | 缓存标识头，如 `x-cache`；留空则只统计状态码 |
 | `-useragent` | Chrome 131 UA | 请求 UA，默认模拟浏览器（见下方「关于 UA 与反爬」） |
@@ -184,65 +191,32 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | 0 | 正常完成 |
 | 1 | 致命错误（健康检查失败、任一 sitemap 拉取失败、空 sitemap、指定的 JSON 报告写入失败） |
 | 3 | 首轮或复检的服务不可用率超过 `-max-error-rate` 阈值（5xx / 429 / 网络异常，其他 4xx 不算） |
-| 4 | 触发熔断：连续失败过多，目标站点疑似过载 |
+| 4 | 压力保护中止：首次超时、连续慢响应或连续失败；JSON `stop_reason` 给出原因 |
 | 130 | 被信号中断（Ctrl+C / SIGTERM） |
 
-## 怎么定 `-size` 和 `-rate`（最容易踩坑的地方）
+## 如何控制预热压力
 
-预热把站打挂，几乎都是这两个参数配错。先用一句话说清分工：
+`-size` 限制工具同时等待的请求数，`-rate` 限制发起请求的速度。两者都不代表 PHP 的实际 CPU 占用，也不能保证服务器上只运行同等数量的任务。特别是客户端超时后，服务端脚本可能仍在执行；继续请求其他页面会积累后台工作。
 
-- **`-size` 决定"同时有几个请求在飞"**，也就是同时占用源站几个 PHP 进程
-- **`-rate` 决定"每秒发起几个请求"**，是期望速率
+动态站从 `-size=1 -rate=1 -delay=1000 -rest-ratio=1` 开始。默认每次请求完成后至少休息 1 秒；非 HIT 请求如耗时 2 秒，就休息至少 2 秒。HIT 也保留最小休息，无缓存标识头的响应按非 HIT 处理。`-delay` 从 v2.7 起是全局完成后休息，原来的非零配置也会遵守此语义。慢响应的冷却与上述休息取较大值，不重复相加。
 
-实际在飞请求数 = `min(size, rate × 单页响应时间)`。
+### 慢响应与超时保护
 
-关键点：**源站一慢，响应时间变长，在飞请求数会顶到 `size` 这个硬上限**。所以 `size` 才是决定"会不会把源站压垮"的参数，`rate` 只是让请求发得慢一点。
+默认响应达到 `-max-latency=3s` 后，全局休息 `-cooldown=10s`；连续 `-max-slow=3` 次慢响应即中止。即使响应是 HTTP 200，且并发已经为 1，也会生效。首次请求超时就中止，不再继续下一页面，避免 PHP 可能尚未退出时继续加压。退出码为 4，日志和 JSON `stop_reason` 会说明原因。
 
-### size 的安全上限
+这些判断依据客户端观察到的响应，不读取服务器 CPU、FPM 队列或数据库锁，不能保证单个重页面不会引发故障。超时仍按原规则进入多日观察，但本轮保护不需要等待自动学习确认。`-max-latency=0` 会同时关闭慢响应及首次超时保护，不建议在动态站使用；`-max-slow=0` 只关闭连续次数中止，仍会冷却且首次超时仍中止。
 
-```
-CONCURRENCY ≤ CPU 核数
-CONCURRENCY ≤ pm.max_children / 3
-```
-
-取两者中更小的那个。
-
-实例（2 核 + `pm.max_children = 8` 的 WordPress 站）：
-- `8/3 = 2`，核数 = 2 → 上限 2
-- **实际用 1**：严格串行，任何时刻只占 1 个 PHP 进程、半个核，其余全留给访客
-
-用 `size=5` 是什么后果：5 个 PHP 进程同时渲染，2 核直接打满，8 个 children 被吃掉 5 个，剩下 3 个还抢不到 CPU，访客访问开始转圈。**这就是最常见的"预热把站搞挂"。**
-
-### rate 取多少
-
-动态站的安全默认值为 `-size=1 -rate=2 -delay=0`。配置了全局 QPS 后，`-delay` 会在响应结束后额外等待；例如 364 个页面、500ms 间隔，固定等待累计约 3 分钟。设为 0 可去掉这部分等待，但实际节省时间仍取决于响应耗时和全局限速。
-
-`size` 定好之后，`rate` 只影响"多久跑完"。串行时实际速率 = `1/单页响应时间`，`rate` 设得比它大也没用。
-
-| 场景 | size | rate | 300 页耗时 |
-|------|------|------|-----------|
-| 2 核小站（最保守） | 1 | 2 | 约 5 分钟 |
-| 4 核 + 对象缓存 | 2 | 4 | 约 1.5 分钟 |
-| 纯静态站 | 8 | 20 | 约 20 秒 |
-
-**预热不需要快。** 缓存 TTL 是小时/天级的，5 分钟和 20 秒对预热效果没有任何区别，但快 15 倍足够把源站打挂。
+`-slow-ratio=3` 继续提供相对基线降并发：建立基线后，最近 20 次平均耗时超出基线 3 倍则将并发减半，最低为 1。它对单并发没有进一步降并发的空间，不能独自承担过载保护。
 
 ### 上线节奏
 
-1. 先查容量：`nproc`、`grep pm.max_children /etc/php-fpm.d/*.conf`
-2. 按上面公式算 `size`，用 `-limit=20` 跑一轮，同时刷浏览器看首页卡不卡
-3. 不卡 → 去掉 `-limit` 跑全量
-4. 还卡 → `size` 继续降（最低 1），**不要靠调 `rate` 解决**
+1. 网站已有卡顿时停止预热和相应定时任务，先恢复服务。
+2. 检查 PHP-FPM 的有效配置及慢日志。`request_terminate_timeout=0` 代表没有启用 FPM 请求终止时限；客户端超时不能替代它。设置服务端时限前，评估上传、后台和定时任务的正常耗时。
+3. 保留原有 `EXCLUDE` 配置，先用 `LIMIT=10 RECHECK=0` 小批量试跑，同时观察网站与 CPU。
+4. 有卡顿或触发退出码 4 时先排查日志，避免立即重跑；降低 RATE、增加 DELAY / REST_RATIO 可以进一步减少持续工作比例。
+5. 小批量验证稳定后逐步扩大范围，再评估全量和复检。单并发仍可能过载，没有仅凭 CPU 核数或 `pm.max_children` 就能推出的安全并发公式。
 
-### 自适应降速
-
-即使参数配错，`-slow-ratio`（默认 3）也会兜底：最近 20 个请求的平均耗时超过基线 3 倍时，并发自动减半，最低降到 1。
-
-```
-源站变慢：最近 20 个请求平均 420ms（基线 90ms），并发 5 → 2
-```
-
-看到这行就说明 `size` 配大了，应该手动调低。设 `-slow-ratio=0` 可关闭。
+升级时同时更新二进制与执行脚本。旧 `precache.env`、cron 或 `EXTRA_ARGS` 中显式设置的 `DELAY=0`、较高 `RATE` / `RETRY` 等值会覆盖新默认，必须检查。不要用示例配置覆盖已有站点地址和排除项。v2.7 默认重试由 2 次降为 1 次，连续失败阈值由 20 降为 3。
 
 ### 毒页面自动学习与慢页面报告
 
@@ -390,8 +364,8 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 
 ## 注意事项
 
-1. **`-size` 才是决定压力大小的参数**：它等于"同时占用源站几个 PHP 进程"。按 `size ≤ min(CPU 核数, pm.max_children/3)` 取，宁可小（详见上方「怎么定 -size 和 -rate」）
-2. **熔断和降速都只是兜底**：熔断要等"整站返回 5xx"，降速要等"连续 20 个请求变慢"，前面的冲击已经发生了。真正的保护是低 `-size` + 灰度 `-limit`
+1. **单并发也要休息**：并发、QPS、完成后休息和慢响应保护共同控制节奏；客户端超时后服务端可能继续工作
+2. **压力保护属于事后反馈**：单个重页面也可能影响访客，先小批量验证、检查 PHP 慢日志，再考虑全量预热
 2. **预热走 CDN 而不是源站**：`-host` 是给"绕过 CDN 直连源站测试"用的，用它预热不会产生 CDN 缓存
 3. **不可缓存页面**：如果大量页面是 `DYNAMIC` / `BYPASS`，说明缓存规则没覆盖到，改规则比反复预热有效
 4. **HTTPS + `-host`**：目标 IP 的证书通常与域名不匹配，需要 `-verify=false`
