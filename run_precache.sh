@@ -268,12 +268,6 @@ rotate_log() {
 acquire_lock
 rotate_log
 
-echo "二进制版本: $VERSION_LINE"
-echo "========================================="
-echo "开始执行预缓存任务: $(date '+%F %T')"
-echo "可执行文件: $EXECUTABLE"
-echo "站点地图:   $SITEMAP_URL"
-
 ARGS=(
     --sitemap="$SITEMAP_URL"
     --size="$CONCURRENCY"
@@ -321,15 +315,10 @@ wait "$CHILD_PID"
 EXIT_CODE=$?
 trap - INT TERM
 
-echo "========================================="
-echo "预缓存任务结束: $(date '+%F %T')，退出码: $EXIT_CODE"
-
+# 二进制负责统一输出；仅补充未进入程序正常退出路径的异常。
 case "$EXIT_CODE" in
-    0)   ;;
-    3)   echo "警告: 首轮或复检的服务不可用率超过阈值，请检查 5xx / 429 / 超时" ;;
-    4)   echo "警告: 已触发压力保护（超时 / 连续慢响应 / 连续失败），请先确认网站和 PHP 请求恢复，勿立即重跑" ;;
-    130) echo "提示: 任务被信号中断" ;;
-    *)   echo "错误: 任务异常退出" ;;
+    0|1|3|4|130) ;;
+    *) echo "启动器错误: 程序异常退出（退出码 $EXIT_CODE），可执行文件 $EXECUTABLE" >&2 ;;
 esac
 
 exit "$EXIT_CODE"

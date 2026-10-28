@@ -100,10 +100,89 @@ func TestCacheStatisticsAndRecheck(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, text := range []string{"首轮请求直接命中率", "旧缓存响应 (STALE)", "原始缓存头分布", "预热后复检命中率", "80.0% (4/5)"} {
+	for _, text := range []string{"── 首轮结果 ──", "直接命中", "STALE 1", "── 复检结果 ──", "复检命中", "80.0% (4/5"} {
 		if !strings.Contains(string(logData), text) {
 			t.Errorf("missing %q in log", text)
 		}
+	}
+	if strings.Contains(string(logData), "[debug]") || strings.Contains(string(logData), "原始缓存头") {
+		t.Error("normal output contains debug diagnostics")
+	}
+}
+
+func TestConsoleSummaryAndDiagnostics(t *testing.T) {
+	for _, debug := range []bool{false, true} {
+		t.Run(fmt.Sprintf("debug=%v", debug), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "output.log")
+			out := newPrinter(path, 5<<20, 7)
+			defer out.Close()
+			pc := newTestCache(t, Config{Sitemap: "https://example.com/sitemap.xml", Debug: debug, CacheHeader: "x-cache", Rate: 2, MaxLatency: 3 * time.Second, MaxFail: 3})
+			pc.out = out
+			pc.printOverview()
+			s := summarize([]Result{
+				{Class: ClassHit, Status: 200, CacheRaw: "HIT"},
+				{Class: ClassStale, Status: 200, CacheRaw: "STALE"},
+				{Class: ClassHTTPError, Status: 503},
+				{},
+			})
+			pc.printStats(s, time.Second, "首轮结果", true)
+			pc.printCompletion(4, fmt.Errorf("fixture error"))
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			text := string(data)
+			for _, required := range []string{"pre-caching " + version, "请求设置", "页面统计  3/4 页", "直接命中  50.0% (1/2", "缓存状态  HIT 1 · STALE 1", "HTTP 状态 200×2 · 503×1", "HTTP 错误 1", "未执行 1", "压力保护中止", "退出码 4", "fixture error"} {
+				if !strings.Contains(text, required) {
+					t.Errorf("missing %q", required)
+				}
+			}
+			if strings.Count(text, "── 首轮结果 ──") != 1 || strings.Count(text, "── 任务结束 ──") != 1 || strings.Contains(text, "已完成") {
+				t.Errorf("duplicate sections or misleading completion: %s", text)
+			}
+			for _, diagnostic := range []string{"[debug]", "UA：", "原始缓存头", "STALE / UPDATING"} {
+				if strings.Contains(text, diagnostic) != debug {
+					t.Errorf("diagnostic %q, debug=%v", diagnostic, debug)
+				}
+			}
+			if strings.Contains(text, "\x1b[") {
+				t.Error("file log contains ANSI escape sequences")
+			}
+		})
+	}
+}
+
+func TestProgressMilestones(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Cache", "HIT")
+	}))
+	defer server.Close()
+	pc := newTestCache(t, Config{Sitemap: server.URL + "/sitemap.xml", Concurrency: 4, CacheHeader: "X-Cache"})
+	path := filepath.Join(t.TempDir(), "progress.log")
+	pc.out = newPrinter(path, 5<<20, 7)
+	defer pc.out.Close()
+	pages := make([]Page, 100)
+	for i := range pages {
+		pages[i] = Page{RawURL: server.URL, URL: server.URL}
+	}
+	if s := summarize(pc.run(context.Background(), pages, "复检")); s.Hit != 100 {
+		t.Fatalf("wrong results: %+v", s)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(data)
+	if strings.Count(text, "复检进度") != 4 {
+		t.Fatalf("expected four progress updates: %s", text)
+	}
+	last := -1
+	for _, percent := range []string{" 25%", " 50%", " 75%", "100%"} {
+		pos := strings.Index(text, percent)
+		if pos <= last {
+			t.Fatalf("missing or unordered milestone %s: %s", percent, text)
+		}
+		last = pos
 	}
 }
 
@@ -516,7 +595,7 @@ func TestSerialSlow200CoolsDownAndStops(t *testing.T) {
 	for i := range pages {
 		pages[i] = Page{RawURL: s.URL, URL: s.URL}
 	}
-	results := pc.run(context.Background(), pages)
+	results := pc.run(context.Background(), pages, "预热")
 	mu.Lock()
 	defer mu.Unlock()
 	if len(starts) != 2 || !pc.aborted() {
@@ -739,7 +818,7 @@ func TestRetriesRespectRate(t *testing.T) {
 	}))
 	defer s.Close()
 	pc := newTestCache(t, Config{Sitemap: s.URL + "/sitemap.xml", Rate: 1, Retries: 1})
-	pc.run(context.Background(), []Page{{RawURL: s.URL, URL: s.URL}})
+	pc.run(context.Background(), []Page{{RawURL: s.URL, URL: s.URL}}, "预热")
 	mu.Lock()
 	defer mu.Unlock()
 	gap := stamps[1].Sub(stamps[0])
@@ -870,7 +949,7 @@ func TestCircuitCountsEachAttempt(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pc.cancel = cancel
-	pc.run(ctx, []Page{{RawURL: s.URL, URL: s.URL}})
+	pc.run(ctx, []Page{{RawURL: s.URL, URL: s.URL}}, "预热")
 	if n := requests.Load(); n != 1 {
 		t.Fatalf("max-fail=1 retry=2, requests before trip=%d", n)
 	}
@@ -1161,7 +1240,7 @@ func TestConcurrencyAndAdaptiveCap(t *testing.T) {
 	for i := range pages {
 		pages[i] = Page{RawURL: s.URL, URL: s.URL}
 	}
-	results := pc.run(context.Background(), pages)
+	results := pc.run(context.Background(), pages, "预热")
 	if peak.Load() > 3 || summarize(results).Skipped != 0 {
 		t.Fatalf("worker cap failed: peak=%d stats=%+v", peak.Load(), summarize(results))
 	}

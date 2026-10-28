@@ -35,7 +35,7 @@ import (
 
 // version 版本号。run_precache.sh 会通过 -version 输出判断二进制是否过旧，
 // 因此修改版本号输出格式时请同步检查脚本的版本自检逻辑。
-const version = "2.7.1"
+const version = "2.7.2"
 
 // 预缓存的目标是"像真实访客那样把页面打进缓存"，所以默认请求头按浏览器构造：
 //   - UA 用常见浏览器串：大量 WAF / Bot 管理（Cloudflare SBFM、云厂商 WAF、
@@ -612,7 +612,7 @@ func (pc *PreCache) loadPages(ctx context.Context) ([]Page, error) {
 		switch doc.XMLName.Local {
 		case "sitemapindex":
 			var childErrors []error
-			pc.out.Muted("  发现 sitemap 索引，包含 %d 个子 sitemap：%s", len(doc.Sitemaps), target)
+			pc.debugf("sitemap 索引：%d 个子 sitemap · %s", len(doc.Sitemaps), target)
 			for _, s := range doc.Sitemaps {
 				if err := walk(strings.TrimSpace(s.Loc), depth+1); err != nil {
 					childErrors = append(childErrors, err)
@@ -883,7 +883,7 @@ func isTimeoutErr(err error) bool {
 // 判定：5xx 或网络异常即中止；403 之类交给后续的 blocked 提示，不拦。
 func (pc *PreCache) healthCheck(ctx context.Context) error {
 	u := pc.scheme + "://" + pc.domain + "/"
-	pc.out.Info("健康检查：GET %s", u)
+	pc.debugf("健康检查：GET %s", u)
 	res, _ := pc.once(ctx, Page{RawURL: u, URL: pc.rewrite(u)}, http.MethodGet)
 	switch {
 	case ctx.Err() != nil:
@@ -895,7 +895,7 @@ func (pc *PreCache) healthCheck(ctx context.Context) error {
 	case res.Class == ClassException:
 		return fmt.Errorf("健康检查失败：%s（%s），源站不可达或响应过慢，中止预热", u, res.Err)
 	}
-	pc.out.Ok("健康检查通过：HTTP %d（%v）", res.Status, res.Elapsed.Round(10*time.Millisecond))
+	pc.out.Info("健康检查  HTTP %d · %s", res.Status, formatDuration(res.Elapsed))
 	return nil
 }
 
@@ -1388,7 +1388,7 @@ func (pc *PreCache) aborted() bool {
 
 // run 用固定数量的 worker 消费任务队列：
 // 不会为每个 URL 起一个 goroutine，结果按索引落位，顺序稳定。
-func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
+func (pc *PreCache) run(ctx context.Context, pages []Page, phase string) []Result {
 	results := make([]Result, len(pages))
 	if len(pages) == 0 {
 		return results
@@ -1406,10 +1406,8 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 		workers = len(pages)
 	}
 
-	progressEvery := int64(0)
-	if len(pages) >= 100 {
-		progressEvery = int64(len(pages) / 10)
-	}
+	runStart := time.Now()
+	pc.out.Info("%s开始  共 %d 页", phase, len(pages))
 
 	// 自适应降速：源站变慢时自动收窄并发，避免把访客挤掉
 	th := newThrottle(workers, pc.cfg.SlowRatio, pc.out)
@@ -1421,7 +1419,8 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 	}()
 
 	// 用局部计数而不是结构体字段：复检会再调一次 run，累加会算出错的百分比
-	var done int64
+	var progressMu sync.Mutex
+	done, nextPercent := 0, 25
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -1442,10 +1441,15 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 				results[idx] = res
 				th.observe(res.Elapsed)
 
-				if progressEvery > 0 {
-					if n := atomic.AddInt64(&done, 1); n%progressEvery == 0 {
-						pc.out.Muted("  进度：%d/%d", n, len(pages))
+				if len(pages) >= 100 && res.Class != ClassSkipped {
+					progressMu.Lock()
+					done++
+					percent := done * 100 / len(pages)
+					if percent >= nextPercent {
+						pc.out.Muted("%s进度  %3d%% · %d/%d 页 · 已用 %s", phase, percent, done, len(pages), formatDuration(time.Since(runStart)))
+						nextPercent += 25
 					}
+					progressMu.Unlock()
 				}
 			}
 		}()
@@ -1582,83 +1586,170 @@ func (s Stats) errRate() float64 {
 	return float64(s.ServerErrors) / float64(completed) * 100
 }
 
-func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, includeRate bool) {
-	hitRate, cacheable := s.hitRate()
-
-	pc.out.Info("---------------------------------------------------------")
-	pc.out.Hint("%s：页面总数 %d，耗时 %s", title, s.Total, elapsed.Round(time.Millisecond))
-	if s.Total > 0 && elapsed > 0 {
-		pc.out.Muted("平均页面吞吐：%.1f pages/s", float64(s.Total-s.Skipped)/elapsed.Seconds())
+// formatDuration 简化人读耗时，JSON 保留精确秒数。
+func formatDuration(d time.Duration) string {
+	if d < time.Millisecond {
+		return "<1ms"
 	}
+	if d < time.Second {
+		return d.Round(time.Millisecond).String()
+	}
+	return d.Round(time.Second).String()
+}
 
+// section 保持终端和文件日志使用相同的分组，不依赖终端宽度或光标控制。
+func (p *Printer) section(title string) {
+	p.Info("")
+	p.Note("── %s ──", title)
+}
+
+func (pc *PreCache) debugf(format string, args ...any) {
+	if pc.cfg.Debug {
+		pc.out.Muted("  [debug] "+format, args...)
+	}
+}
+
+func (pc *PreCache) printOverview() {
+	pc.out.Info("")
+	pc.out.Note("pre-caching %s  ·  %s", version, pc.startTime.Format("2006-01-02 15:04:05"))
+	pc.out.Info("站点地图  %s", pc.cfg.Sitemap)
+	method := "GET"
+	if pc.cfg.UseHead {
+		method = "HEAD"
+	}
+	rate := fmt.Sprintf("%.1f req/s", pc.cfg.Rate)
+	if pc.cfg.Rate == 0 {
+		rate = "不限速"
+	}
+	pc.out.Info("请求设置  %s · 并发 %d · 上限 %s · 超时 %v · 重试 %d 次", method, pc.cfg.Concurrency, rate, pc.cfg.Timeout, pc.cfg.Retries)
+	pc.out.Info("休息策略  最少 %v · 非 HIT 耗时 × %.1f（取较大值）", pc.cfg.Delay, pc.cfg.RestRatio)
+	cache := pc.cfg.CacheHeader
+	if cache == "" {
+		cache = "未配置"
+	}
+	recheck := "关闭"
+	if pc.cfg.Recheck > 0 {
+		recheck = fmt.Sprintf("首轮结束后等待 %v", pc.cfg.Recheck)
+	}
+	pc.out.Info("缓存检测  %s · 复检 %s", cache, recheck)
+	if pc.cfg.Host != "" {
+		pc.out.Info("访问主机  %s · Host %s", pc.cfg.Host, pc.domain)
+	}
+	if pc.cfg.Rate == 0 {
+		pc.out.Warn("注意      全局限速已关闭")
+	}
+	if pc.cfg.MaxLatency == 0 {
+		pc.out.Warn("注意      慢响应及首次超时保护已关闭")
+	}
+	if pc.cfg.MaxFail == 0 {
+		pc.out.Warn("注意      连续失败熔断已关闭")
+	}
+	pc.debugf("保护：慢响应阈值 %v · 冷却 %v · 连续慢响应 %d 次 · 连续失败 %d 次", pc.cfg.MaxLatency, pc.cfg.Cooldown, pc.cfg.MaxSlow, pc.cfg.MaxFail)
+	pc.debugf("自适应降速：基线 × %.1f（0 关闭）；首次超时中止由慢响应保护控制", pc.cfg.SlowRatio)
+	pc.debugf("SSL 校验：%v · UA：%s", pc.cfg.Insecure, pc.cfg.UserAgent)
+	if !pc.cfg.NoLearn && pc.cfg.LearnPath != "" {
+		pc.debugf("自动排除：连续 %d 天超时 · %s", slowPageDays, pc.cfg.LearnPath)
+	}
+	pc.out.section("准备")
+}
+
+func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, includeRate bool) {
+	pc.out.section(title)
+	completed := s.Total - s.Skipped
+	speed := 0.0
+	if elapsed > 0 {
+		speed = float64(completed) / elapsed.Seconds()
+	}
+	pc.out.Info("页面统计  %d/%d 页 · 耗时 %s · %.1f 页/s", completed, s.Total, formatDuration(elapsed), speed)
 	if pc.cfg.CacheHeader != "" {
-		pc.out.Ok("  直接命中 (HIT)       ：%d", s.Hit)
-		for _, row := range []struct {
+		if hitRate, total := s.hitRate(); total > 0 && includeRate {
+			pc.out.Ok("直接命中  %.1f%% (%d/%d，仅 HIT)", hitRate, s.Hit, total)
+		}
+		parts := []string{fmt.Sprintf("HIT %d", s.Hit)}
+		for _, item := range []struct {
 			label string
-			count int
+			n     int
 		}{
-			{"未命中 (MISS)", s.Miss}, {"已过期 (EXPIRED)", s.Expired},
-			{"旧缓存响应 (STALE)", s.Stale}, {"更新中 (UPDATING)", s.Updating},
-			{"验证有效 (REVALIDATED)", s.Revalidated},
+			{"MISS", s.Miss}, {"EXPIRED", s.Expired}, {"STALE", s.Stale},
+			{"UPDATING", s.Updating}, {"REVALIDATED", s.Revalidated},
 		} {
-			if row.count > 0 {
-				pc.out.Info("  %s：%d", row.label, row.count)
+			if item.n > 0 {
+				parts = append(parts, fmt.Sprintf("%s %d", item.label, item.n))
 			}
 		}
-		if s.Uncacheable > 0 {
-			pc.out.Err("  不可缓存          ：%d", s.Uncacheable)
-			// 典型误用：用 HEAD 预热，而 CDN 只对 GET 建立缓存，结果全是 BYPASS
-			if pc.cfg.UseHead && s.Hit == 0 && s.recheckCount() == 0 {
-				pc.out.Warn("  提示：全部页面都不可缓存，很可能是 -head 导致的（多数 CDN 只对 GET 建立缓存），去掉 -head 再试")
+		// 每行最多三个状态，避免窄终端下长行换行。
+		for i := 0; i < len(parts); i += 3 {
+			end := i + 3
+			if end > len(parts) {
+				end = len(parts)
 			}
+			label := "缓存状态"
+			if i > 0 {
+				label = "        "
+			}
+			pc.out.Info("%s  %s", label, strings.Join(parts[i:end], " · "))
 		}
-		if s.NoHeader > 0 {
-			pc.out.Warn("  缺少缓存标识头    ：%d", s.NoHeader)
+		if s.Uncacheable > 0 || s.NoHeader > 0 {
+			pc.out.Warn("其他响应  不可缓存 %d · 无缓存头 %d", s.Uncacheable, s.NoHeader)
 		}
-		if cacheable > 0 && includeRate {
-			pc.out.Ok("  %s直接命中率（仅 HIT）：%.1f%% (%d/%d)", title, hitRate, s.Hit, cacheable)
+		if pc.cfg.UseHead && s.Uncacheable > 0 && s.Hit == 0 && s.recheckCount() == 0 {
+			pc.out.Warn("提示      HEAD 可能无法建立缓存，建议使用 GET")
 		}
-		if s.Stale+s.Updating > 0 {
-			pc.out.Info("  STALE / UPDATING 表示返回旧缓存，可能正在后台更新，不等同于 MISS")
-		}
-		if s.Revalidated > 0 {
-			pc.out.Info("  REVALIDATED 表示缓存经源站验证仍有效，不等同于 MISS")
-		}
-		if len(s.CacheStatuses) > 0 {
+		if pc.cfg.Debug {
+			if s.Stale+s.Updating > 0 {
+				pc.debugf("STALE / UPDATING：返回旧缓存，可能正在后台更新")
+			}
+			if s.Revalidated > 0 {
+				pc.debugf("REVALIDATED：缓存经源站验证仍有效")
+			}
 			var keys []string
 			for key := range s.CacheStatuses {
 				keys = append(keys, key)
 			}
 			sort.Strings(keys)
-			var parts []string
 			for _, key := range keys {
-				parts = append(parts, fmt.Sprintf("%q×%d", key, s.CacheStatuses[key]))
+				pc.debugf("原始缓存头 %s：%q × %d", pc.cfg.CacheHeader, key, s.CacheStatuses[key])
 			}
-			pc.out.Info("  原始缓存头分布（%s）：%s", pc.cfg.CacheHeader, strings.Join(parts, "  "))
 		}
 	} else {
-		pc.out.Warn("未指定 -cacheheader，跳过缓存状态统计")
+		pc.out.Muted("缓存检测  未配置缓存头，仅统计 HTTP 状态")
 	}
-
-	if s.NotFound > 0 {
-		pc.out.Warn("  404/410 页面      ：%d", s.NotFound)
-	}
-	if s.HTTPError > 0 {
-		pc.out.Err("  HTTP 错误页面     ：%d", s.HTTPError)
-	}
-	// 403/429/503 集中出现，通常不是页面坏了，而是被 WAF 或限流拦了
-	if blocked := s.blocked(); blocked > 0 && blocked*4 >= s.Total {
-		pc.out.Warn("  提示：%d 个请求返回 403/429/503，疑似被 WAF / 限流拦截", blocked)
-		pc.out.Warn("        可尝试：-useragent 换浏览器 UA、降低 -rate/-size，或把预热机 IP 加白名单")
-	}
-	if s.Exception > 0 {
-		pc.out.Err("  请求异常页面      ：%d", s.Exception)
+	pc.printStatusCodes(s)
+	if s.NotFound+s.HTTPError+s.Exception+s.Skipped > 0 {
+		pc.out.Warn("异常统计  404/410 %d · HTTP 错误 %d · 网络异常 %d · 未执行 %d", s.NotFound, s.HTTPError, s.Exception, s.Skipped)
 	}
 	if s.Retried > 0 {
-		pc.out.Muted("  经过重试的请求    ：%d", s.Retried)
+		pc.out.Muted("重试页面  %d", s.Retried)
 	}
-	if s.Skipped > 0 {
-		pc.out.Warn("  未执行（被中断）  ：%d", s.Skipped)
+	if blocked := s.blocked(); blocked > 0 && blocked*4 >= s.Total {
+		pc.out.Warn("访问受限  %d 页返回 403/429/503；检查 WAF、限流和源站负载", blocked)
+	}
+}
+
+// printCompletion 的正常结束只表示任务执行完毕，缓存效果以各轮统计为准。
+func (pc *PreCache) printCompletion(code int, err error) {
+	pc.out.section("任务结束")
+	status := "已完成"
+	switch code {
+	case 3:
+		status = "错误率超限"
+	case 4:
+		status = "压力保护中止"
+	case 130:
+		status = "已中断"
+	default:
+		if code != 0 {
+			status = "执行失败"
+		}
+	}
+	line := fmt.Sprintf("%s  %s · 总耗时 %s · 退出码 %d", status, time.Now().Format("15:04:05"), formatDuration(time.Since(pc.startTime)), code)
+	if code == 0 {
+		pc.out.Ok("%s", line)
+	} else {
+		pc.out.Warn("%s", line)
+	}
+	if err != nil {
+		pc.out.Err("原因      %v", err)
 	}
 }
 
@@ -1666,12 +1757,15 @@ func (pc *PreCache) printFailures(s Stats) {
 	if len(s.Failures) == 0 {
 		return
 	}
-	limit := 20
-	pc.out.Info("---------------------------------------------------------")
-	pc.out.Warn("失败明细（共 %d 条，最多显示 %d 条）：", len(s.Failures), limit)
+	limit := 5
+	if pc.cfg.Debug {
+		limit = 20
+	}
+	pc.out.section("失败明细")
+	pc.out.Warn("共 %d 页，最多显示 %d 页", len(s.Failures), limit)
 	for i, r := range s.Failures {
 		if i >= limit {
-			pc.out.Muted("  ... 其余 %d 条见日志 / JSON 报告", len(s.Failures)-limit)
+			pc.out.Muted("  其余 %d 页可通过 -json 导出完整明细", len(s.Failures)-limit)
 			break
 		}
 		reason := r.Err
@@ -1711,8 +1805,8 @@ func (pc *PreCache) printSlowest(results []Result) {
 	if len(rs) == 0 {
 		return
 	}
-	pc.out.Info("---------------------------------------------------------")
-	pc.out.Hint("最慢的页面 Top %d（单次请求耗时 >%v，超时页面始终列出）：", len(rs), pc.cfg.SlowThreshold)
+	pc.out.section("慢页面")
+	pc.out.Info("最慢 %d 页 · 阈值 >%v · 包含所有超时", len(rs), pc.cfg.SlowThreshold)
 	for _, r := range rs {
 		mark := ""
 		if r.Timeout {
@@ -1736,7 +1830,7 @@ func (pc *PreCache) printStatusCodes(s Stats) {
 	for _, c := range codes {
 		parts = append(parts, fmt.Sprintf("%d×%d", c, s.StatusCodes[c]))
 	}
-	pc.out.Muted("状态码分布：%s", strings.Join(parts, "  "))
+	pc.out.Info("HTTP 状态 %s", strings.Join(parts, " · "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1888,44 +1982,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	pc.cancel = cancel
 	defer cancel()
 
-	pc.out.Note("执行开始时间：%s", pc.startTime.Format("2006-01-02 15:04:05"))
-	pc.out.Info("站点地图：%s", pc.cfg.Sitemap)
-	if pc.cfg.Host != "" {
-		pc.out.Info("指定主机：%s（Host 头：%s）", pc.cfg.Host, pc.domain)
-	}
-	pc.out.Info("并发数量：%d", pc.cfg.Concurrency)
-	if pc.cfg.Rate > 0 {
-		pc.out.Info("全局限速：%.1f req/s", pc.cfg.Rate)
-	} else {
-		pc.out.Warn("全局限速：已关闭（-rate=0），压力仅受并发与额外间隔限制，请确认这是你要的")
-	}
-	pc.out.Info("请求完成后全局最小休息：%v；非 HIT 额外休息：耗时 × %.1f（取两者较大值）", pc.cfg.Delay, pc.cfg.RestRatio)
-	if pc.cfg.MaxLatency > 0 {
-		pc.out.Info("慢响应保护：达到 %v 后全局休息 %v；连续 %d 次中止（0=不按次数中止），首次超时立即中止", pc.cfg.MaxLatency, pc.cfg.Cooldown, pc.cfg.MaxSlow)
-	} else {
-		pc.out.Warn("慢响应/首次超时保护已关闭（-max-latency=0）")
-	}
-	pc.out.Info("超时时间：%v，重试：%d 次", pc.cfg.Timeout, pc.cfg.Retries)
-	if pc.cfg.MaxFail > 0 {
-		pc.out.Info("熔断阈值：连续 %d 个请求失败即中止", pc.cfg.MaxFail)
-	} else {
-		pc.out.Warn("熔断：已关闭（-max-fail=0），站点过载时不会自动停手")
-	}
-	if pc.cfg.SlowRatio > 0 {
-		pc.out.Info("自适应降速：平均耗时超过基线 %.1f 倍时自动降并发", pc.cfg.SlowRatio)
-	} else {
-		pc.out.Warn("自适应降速：已关闭（-slow-ratio=0），源站变慢时不会自动收手")
-	}
-	if pc.cfg.CacheHeader != "" {
-		pc.out.Info("缓存标识：%s", pc.cfg.CacheHeader)
-	}
-	pc.out.Info("SSL 校验：%v", pc.cfg.Insecure)
-	pc.out.Info("UA  标识：%s", pc.cfg.UserAgent)
-	if !pc.cfg.NoLearn && pc.cfg.LearnPath != "" {
-		pc.out.Info("毒页面学习：%s（连续 %d 天超时才自动排除，-no-learn 关闭）", pc.cfg.LearnPath, slowPageDays)
-	}
-	pc.out.Hint("预缓存开始:")
-	pc.out.Info("---------------------------------------------------------")
+	pc.printOverview()
 
 	// 手动排除保留子串语义；学习出的完整 URL 使用精确匹配。
 	learned := map[string]bool{}
@@ -1944,7 +2001,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		return 1, err
 	}
 
-	pc.out.Info("开始解析站点地图...")
+	pc.debugf("开始解析站点地图")
 	pages, err := pc.loadPages(ctx)
 	if err != nil {
 		if ctx.Err() != nil {
@@ -1955,7 +2012,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	if len(pages) == 0 && !(pc.cfg.LastMod > 0 && pc.discovered > 0) {
 		return 1, fmt.Errorf("未从 sitemap 中提取到任何页面，请检查 sitemap 是否符合规范或 -lastmod 过滤是否过严")
 	}
-	pc.out.Ok("提取网址成功，共 %d 条（已去重）", len(pages))
+	pc.out.Info("页面发现  %d 页（已去重）", len(pages))
 	if len(pages) == 0 {
 		pc.out.Ok("增量检查完成：没有最近变更的页面，无需预热")
 	}
@@ -1996,7 +2053,8 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		pages = pages[:pc.cfg.Limit]
 	}
 
-	results := pc.run(ctx, pages)
+	pc.out.section("预热")
+	results := pc.run(ctx, pages, "预热")
 	elapsed := time.Since(pc.startTime)
 	stats := summarize(results)
 
@@ -2006,16 +2064,15 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		pc.out.Warn("收到中断信号，已提前结束，以下为部分结果")
 	}
 
-	pc.printStats(stats, elapsed, "首轮请求", true)
-	pc.printStatusCodes(stats)
+	pc.printStats(stats, elapsed, "首轮结果", true)
 	pc.printFailures(stats)
 	pc.printSlowest(results)
 
 	// 预热后复检：自动验证缓存是否真的生效
 	var rc *jsonRecheck
 	if pc.cfg.Recheck > 0 && stats.recheckCount() > 0 && ctx.Err() == nil && !pc.aborted() {
-		pc.out.Info("---------------------------------------------------------")
-		pc.out.Hint("等待 %v 后进行缓存复检...", pc.cfg.Recheck)
+		pc.out.section("复检")
+		pc.out.Info("复检准备  %d 页待确认 · 等待 %v", stats.recheckCount(), pc.cfg.Recheck)
 		sleep(ctx, pc.cfg.Recheck)
 
 		var recheckPages []Page
@@ -2025,14 +2082,14 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 			}
 		}
 		reStart := time.Now()
-		reResults := pc.run(ctx, recheckPages)
+		reResults := pc.run(ctx, recheckPages, "复检")
 		reStats := summarize(reResults)
-		pc.printStats(reStats, time.Since(reStart), "复检请求", false)
-		pc.printStatusCodes(reStats)
+		pc.printStats(reStats, time.Since(reStart), "复检结果", false)
 		rate := float64(reStats.Hit) / float64(len(recheckPages)) * 100
-		pc.out.Ok("预热后复检命中率（仅首轮待确认页面）：%.1f%% (%d/%d)", rate, reStats.Hit, len(recheckPages))
+		pc.out.Info("复检命中  %.1f%% (%d/%d，仅 HIT)", rate, reStats.Hit, len(recheckPages))
+		pc.out.Muted("复检范围  仅首轮待确认页面")
 		if reStats.Hit < len(recheckPages) {
-			pc.out.Warn("仍有 %d 个页面未确认命中（含请求错误和未执行），请结合复检明细检查缓存规则或源站响应",
+			pc.out.Warn("待确认    %d 页未直接 HIT（含错误及未执行），见上方状态",
 				len(recheckPages)-reStats.Hit)
 		}
 		rc = &jsonRecheck{
@@ -2061,7 +2118,9 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		}
 		pc.printFailures(reStats)
 	} else if pc.cfg.Recheck == 0 && stats.recheckCount() > 0 {
-		pc.out.Info("未启用预热后复检：以上仅为首轮响应状态，不能据此确认缓存已写入或更新；使用 -recheck=5s 验证")
+		pc.out.Muted("复检状态  未启用 · %d 页待确认，可用 -recheck=5s 验证", stats.recheckCount())
+	} else if pc.cfg.Recheck > 0 && stats.recheckCount() == 0 && ctx.Err() == nil && !pc.aborted() {
+		pc.out.Muted("复检状态  无待确认页面，已跳过")
 	}
 
 	// 更新每日观察记录，连续多天超时的 URL 才记入 slow-pages.txt。
@@ -2083,7 +2142,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 			}
 			return 1, fmt.Errorf("写入 JSON 报告失败：%w", err)
 		}
-		pc.out.Muted("JSON 报告已写入：%s", pc.cfg.JSONPath)
+		pc.out.Info("JSON 报告 %s", pc.cfg.JSONPath)
 	}
 	return code, nil
 }
@@ -2211,13 +2270,9 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	out.Info("===== 预缓存任务开始 =====")
 	code, err := pc.Start(ctx)
-	if err != nil {
-		out.Err("执行失败：%v", err)
-	}
 	pc.transport.CloseIdleConnections()
-	out.Info("===== 预缓存任务结束（退出码 %d）=====", code)
+	pc.printCompletion(code, err)
 	out.Close() // os.Exit 会跳过 defer，日志文件必须显式关闭
 	os.Exit(code)
 }
