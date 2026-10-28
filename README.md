@@ -14,13 +14,7 @@ Go 编写的网站预缓存工具，通过访问 sitemap 中的页面触发 CDN 
 
 ```bash
 ./release.sh
-```
 
-菜单输入支持退格和方向键编辑，直接回车选择全部架构；输入提示不带 `v`，只需输入 `2.7.3` 这样的三段数字。发布时自动添加 `v` 前缀，构建结果、版本查询和 JSON 报告统一使用 `v2.7.3`。
-
-构建前会自动检查代码并运行测试，`dist/` 只输出所选架构的二进制。将对应二进制与项目根目录的 `run_precache.sh`、`precache.env.example` 上传到服务器，放在同一目录，例如 `/opt/pre-caching/`。服务器无需安装 Go。
-
-```bash
 # 以 amd64 服务器为例，arm64 使用 pre-caching-arm64
 scp dist/pre-caching-amd64 run_precache.sh precache.env.example user@server:/opt/pre-caching/
 ```

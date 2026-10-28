@@ -142,53 +142,6 @@ fi
 chmod +x "$EXECUTABLE" 2>/dev/null
 
 # ---------------------------------------------------------------------------
-# 版本自检
-# 用 -version 的输出来判定，而不是解析 -h 的 usage 文本：
-#   - 解析 usage 依赖参数名，参数一改就失效
-#   - `cmd | grep -q` 在 pipefail 下可能因 SIGPIPE 误判为失败
-# 脚本会传 -log-retention-days 等 v2.7.1 才有的参数，旧版二进制遇到未知参数
-# 只会打一行 "flag provided but not defined" 然后退出 2，很难定位。
-# ---------------------------------------------------------------------------
-VERSION_LINE="$("$EXECUTABLE" -version 2>&1 || true)"
-VERSION_LINE="${VERSION_LINE%%$'\n'*}"
-
-version_supported() {
-    local major minor patch
-    if [[ "$VERSION_LINE" =~ ^pre-caching\ v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
-        major="${BASH_REMATCH[1]}"
-        minor="${BASH_REMATCH[2]}"
-        patch="${BASH_REMATCH[3]}"
-        (( 10#$major > 2 || (10#$major == 2 && (10#$minor > 7 || (10#$minor == 7 && 10#$patch >= 1))) ))
-        return $?
-    fi
-    return 1
-}
-
-if ! version_supported; then
-    FILE_INFO="$(ls -l "$EXECUTABLE" 2>/dev/null | awk '{print $5" 字节, 修改时间 "$6" "$7" "$8}')"
-    cat >&2 <<EOF
-错误: $EXECUTABLE 版本过旧或格式无效，当前脚本需要 v2.7.1 及以上版本
-      -version 实际输出: ${VERSION_LINE:-<空>}
-      文件信息: ${FILE_INFO:-<无法读取>}
-      文件类型: $(file -b "$EXECUTABLE" 2>/dev/null | cut -c1-60)
-
-      当前脚本使用日志轮转参数，需要 pre-caching v2.7.1 及以上版本。请在部署目录下执行：
-
-        ls -l $EXECUTABLE
-        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching v2.7.1 或更新版本
-
-      若上面显示的还是旧内容，说明上传没有覆盖成功（常见原因：上传到了
-      另一个目录、文件名不一致、或旧进程仍占用文件）。请在源码目录重新构建：
-
-        ./release.sh
-
-      在菜单中选择架构并输入版本号，再将 dist 中对应架构的二进制和
-      run_precache.sh 一起上传到部署目录。
-EOF
-    exit 1
-fi
-
-# ---------------------------------------------------------------------------
 # 防重叠执行：上一次还没跑完就跳过本次，避免压力叠加
 # ---------------------------------------------------------------------------
 acquire_lock() {
