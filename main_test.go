@@ -132,8 +132,8 @@ func TestConsoleSummaryAndDiagnostics(t *testing.T) {
 				t.Fatal(err)
 			}
 			text := string(data)
-			for _, required := range []string{"pre-caching " + version, "请求设置", "页面统计  3/4 页", "直接命中  50.0% (1/2", "缓存状态  HIT 1 · STALE 1", "HTTP 状态 200×2 · 503×1", "HTTP 错误 1", "未执行 1", "压力保护中止", "退出码 4", "fixture error"} {
-				if !strings.Contains(text, required) {
+			for _, required := range []string{"开始执行时间", "请求设置", "页面统计 3/4 页", "直接命中 50.0% (1/2", "缓存状态 HIT 1 · STALE 1", "HTTP状态 200 × 2 · 503 × 1", "HTTP 错误 1", "未执行 1", "压力保护中止", "退出码 4", "fixture error"} {
+				if !strings.Contains(strings.Join(strings.Fields(text), " "), required) {
 					t.Errorf("missing %q", required)
 				}
 			}
@@ -145,6 +145,9 @@ func TestConsoleSummaryAndDiagnostics(t *testing.T) {
 					t.Errorf("diagnostic %q, debug=%v", diagnostic, debug)
 				}
 			}
+			if strings.Contains(text, "pre-caching ") || strings.Contains(text, "二进制版本") {
+				t.Error("normal startup contains a version banner")
+			}
 			if strings.Contains(text, "\x1b[") {
 				t.Error("file log contains ANSI escape sequences")
 			}
@@ -152,7 +155,7 @@ func TestConsoleSummaryAndDiagnostics(t *testing.T) {
 	}
 }
 
-func TestProgressMilestones(t *testing.T) {
+func TestProgressStartsImmediatelyAndFinishes(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Cache", "HIT")
 	}))
@@ -173,16 +176,161 @@ func TestProgressMilestones(t *testing.T) {
 		t.Fatal(err)
 	}
 	text := string(data)
-	if strings.Count(text, "复检进度") != 4 {
-		t.Fatalf("expected four progress updates: %s", text)
+	if strings.Count(text, "复检进度") != 5 {
+		t.Fatalf("expected initial, 25/50/75 percent and final progress updates: %s", text)
 	}
 	last := -1
-	for _, percent := range []string{" 25%", " 50%", " 75%", "100%"} {
+	for _, percent := range []string{"  0%", " 25%", " 50%", " 75%", "100%"} {
 		pos := strings.Index(text, percent)
 		if pos <= last {
 			t.Fatalf("missing or unordered milestone %s: %s", percent, text)
 		}
 		last = pos
+	}
+}
+
+func TestOutputColumnAlignment(t *testing.T) {
+	for _, tt := range []struct {
+		text string
+		want int
+	}{{"开始执行时间", 12}, {"HTTP状态", 8}, {"JSON报告", 8}, {"e\u0301", 1}, {"ＡＢ", 4}} {
+		if got := displayWidth(tt.text); got != tt.want {
+			t.Errorf("displayWidth(%q)=%d, want %d", tt.text, got, tt.want)
+		}
+	}
+	var console bytes.Buffer
+	out := &Printer{console: &console}
+	for _, label := range []string{"开始执行时间", "请求设置", "HTTP状态", "JSON报告", "原因", ""} {
+		out.row("", label, "VALUE")
+	}
+	for _, line := range strings.Split(strings.TrimSuffix(console.String(), "\n"), "\n") {
+		if pos := strings.Index(line, "VALUE"); pos < 0 || displayWidth(line[:pos]) != 14 {
+			t.Errorf("content not aligned at column 15: %q", line)
+		}
+	}
+	console.Reset()
+	pc := newTestCache(t, Config{Sitemap: "https://example.com/sitemap.xml", CacheHeader: "X-Cache"})
+	pc.out = out
+	pc.printStats(Stats{Total: 1234, Hit: 1000, Miss: 200, Expired: 30, Stale: 1, Updating: 2, Revalidated: 1}, time.Second, "首轮结果", true)
+	var rows []string
+	for _, line := range strings.Split(console.String(), "\n") {
+		if strings.Contains(line, "HIT ") || strings.Contains(line, "STALE ") {
+			rows = append(rows, line)
+		}
+	}
+	if len(rows) != 2 {
+		t.Fatalf("expected two cache rows: %s", console.String())
+	}
+	for column := 0; column < 3; column++ {
+		a, b := strings.Split(rows[0], " · "), strings.Split(rows[1], " · ")
+		if displayWidth(a[column]) != displayWidth(b[column]) {
+			t.Errorf("cache column %d shifts: %q vs %q", column, a[column], b[column])
+		}
+	}
+}
+
+func TestProgressAnimationDoesNotFloodLog(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		t.Run(fmt.Sprintf("terminal=%v", terminal), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "progress.log")
+			out := newPrinter(path, 5<<20, 7)
+			defer out.Close()
+			var console bytes.Buffer
+			out.console, out.color = &console, terminal
+			progress := newProgressDisplay(out, "预热", 2, 10*time.Millisecond)
+			defer func() {
+				if progress != nil {
+					progress.finish()
+				}
+			}()
+			initial, err := os.ReadFile(path)
+			if err != nil || !strings.Contains(string(initial), "0/2 页") {
+				t.Fatalf("initial progress delayed: %s, %v", initial, err)
+			}
+			// 等待期间终端继续刷新，但文件不追加定时进度。
+			started := time.Now()
+			deadline := started.Add(2 * time.Second)
+			for {
+				out.mu.Lock()
+				frames := strings.Count(console.String(), "\r\x1b[2K")
+				out.mu.Unlock()
+				if (terminal && frames >= 3) || (!terminal && time.Since(started) >= 30*time.Millisecond) {
+					break
+				}
+				if time.Now().After(deadline) {
+					t.Fatal("no terminal animation while requests are waiting")
+				}
+				time.Sleep(time.Millisecond)
+			}
+			waiting, err := os.ReadFile(path)
+			if err != nil || strings.Count(string(waiting), "预热进度") != 1 {
+				t.Fatalf("waiting added progress lines to file: %s, %v", waiting, err)
+			}
+			out.Warn("fixture warning")
+			progress.advance()
+			progress.advance()
+			progress.finish()
+			progress = nil
+			out.row("", "执行结果", "已完成")
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if strings.Count(string(data), "预热进度") != 3 {
+				t.Fatalf("expected only 0/50/100 percent in file: %s", data)
+			}
+			if strings.ContainsAny(string(data), "\r\x1b⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏") || !strings.Contains(string(data), "100% · 2/2 页") {
+				t.Fatalf("invalid file log: %s", data)
+			}
+			out.mu.Lock()
+			defer out.mu.Unlock()
+			if strings.Contains(console.String(), "\x1b[2K") != terminal || out.live != "" {
+				t.Fatalf("invalid animation lifecycle: %q", console.String())
+			}
+			if !strings.HasSuffix(console.String(), "执行结果      已完成\n") {
+				t.Fatalf("animation corrupted subsequent output: %q", console.String())
+			}
+		})
+	}
+}
+
+func TestProgressPartialAndSmallTasks(t *testing.T) {
+	for _, terminal := range []bool{false, true} {
+		for _, tt := range []struct {
+			total, done int
+			percentages string
+		}{
+			{368, 60, "0% 16%"},
+			{368, 92, "0% 25%"},
+			{368, 368, "0% 25% 50% 75% 100%"},
+			{1, 1, "0% 100%"},
+			{3, 3, "0% 33% 66% 100%"},
+		} {
+			t.Run(fmt.Sprintf("terminal=%v/%dof%d", terminal, tt.done, tt.total), func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "progress.log")
+				out := newPrinter(path, 5<<20, 7)
+				defer out.Close()
+				out.console, out.color = &bytes.Buffer{}, terminal
+				p := newProgressDisplay(out, "预热", tt.total, time.Hour)
+				for i := 0; i < tt.done; i++ {
+					p.advance()
+				}
+				p.finish()
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var percentages []string
+				for _, line := range strings.Split(string(data), "\n") {
+					if strings.HasPrefix(line, "预热进度") {
+						percentages = append(percentages, strings.Fields(line)[1])
+					}
+				}
+				if got := strings.Join(percentages, " "); got != tt.percentages {
+					t.Fatalf("got %q, want %q: %s", got, tt.percentages, data)
+				}
+			})
+		}
 	}
 }
 

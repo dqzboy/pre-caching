@@ -154,7 +154,7 @@ VERSION_LINE="${VERSION_LINE%%$'\n'*}"
 
 version_supported() {
     local major minor patch
-    if [[ "$VERSION_LINE" =~ ^pre-caching\ ([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
+    if [[ "$VERSION_LINE" =~ ^pre-caching\ v?([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
         major="${BASH_REMATCH[1]}"
         minor="${BASH_REMATCH[2]}"
         patch="${BASH_REMATCH[3]}"
@@ -175,13 +175,15 @@ if ! version_supported; then
       当前脚本使用日志轮转参数，需要 pre-caching v2.7.1 及以上版本。请在部署目录下执行：
 
         ls -l $EXECUTABLE
-        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching 2.7.1 或更新版本
+        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching v2.7.1 或更新版本
 
       若上面显示的还是旧内容，说明上传没有覆盖成功（常见原因：上传到了
-      另一个目录、文件名不一致、或旧进程仍占用文件）。重新编译并上传：
+      另一个目录、文件名不一致、或旧进程仍占用文件）。请在源码目录重新构建：
 
-        GOOS=linux GOARCH=amd64 go build -ldflags="-s -w" -o pre-caching-amd64 main.go
-        GOOS=linux GOARCH=arm64 go build -ldflags="-s -w" -o pre-caching-arm64 main.go
+        ./release.sh
+
+      在菜单中选择架构并输入版本号，再将 dist 中对应架构的二进制和
+      run_precache.sh 一起上传到部署目录。
 EOF
     exit 1
 fi

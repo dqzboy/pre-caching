@@ -27,15 +27,16 @@ import (
 	"sync/atomic"
 	"syscall"
 	"time"
+	"unicode"
 )
 
 // ---------------------------------------------------------------------------
 // 终端 / 日志输出
 // ---------------------------------------------------------------------------
 
-// version 版本号。run_precache.sh 会通过 -version 输出判断二进制是否过旧，
-// 因此修改版本号输出格式时请同步检查脚本的版本自检逻辑。
-const version = "2.7.2"
+// version 由 release.sh 通过 -ldflags "-X main.version=v..." 注入。
+// 直接 go build 的开发构建标为 dev；-version 与 JSON 报告共用此值。
+var version = "dev"
 
 // 预缓存的目标是"像真实访客那样把页面打进缓存"，所以默认请求头按浏览器构造：
 //   - UA 用常见浏览器串：大量 WAF / Bot 管理（Cloudflare SBFM、云厂商 WAF、
@@ -68,10 +69,12 @@ type Printer struct {
 	color            bool
 	logMaxBytes      int64
 	logRetentionDays int
+	console          io.Writer
+	live             string
 }
 
 func newPrinter(logPath string, maxBytes int64, retentionDays int) *Printer {
-	p := &Printer{color: isTerminal(), logMaxBytes: maxBytes, logRetentionDays: retentionDays}
+	p := &Printer{color: isTerminal(), console: os.Stdout, logMaxBytes: maxBytes, logRetentionDays: retentionDays}
 	if logPath != "" {
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -147,7 +150,7 @@ func maintainLog(f *os.File, maxBytes int64, retentionDays int, incoming int64, 
 }
 
 func isTerminal() bool {
-	if os.Getenv("NO_COLOR") != "" {
+	if os.Getenv("NO_COLOR") != "" || os.Getenv("TERM") == "dumb" {
 		return false
 	}
 	fi, err := os.Stdout.Stat()
@@ -163,11 +166,29 @@ func (p *Printer) Printf(color, format string, a ...any) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
-	if p.color && color != "" {
-		fmt.Printf("%s%s%s\n", color, msg, ansiReset)
-	} else {
-		fmt.Println(msg)
+	if p.live != "" {
+		fmt.Fprint(p.consoleWriter(), "\r\033[2K")
 	}
+	if p.color && color != "" {
+		fmt.Fprintf(p.consoleWriter(), "%s%s%s\n", color, msg, ansiReset)
+	} else {
+		fmt.Fprintln(p.consoleWriter(), msg)
+	}
+	if p.live != "" {
+		fmt.Fprint(p.consoleWriter(), p.live)
+	}
+	p.writeLog(msg)
+}
+
+func (p *Printer) consoleWriter() io.Writer {
+	if p.console != nil {
+		return p.console
+	}
+	return os.Stdout
+}
+
+// writeLog 的调用方持有 mu；文件只接收纯文本，不写入动画和光标控制符。
+func (p *Printer) writeLog(msg string) {
 	if p.file != nil {
 		if p.logMaxBytes > 0 && p.logRetentionDays > 0 {
 			if err := maintainLog(p.file, p.logMaxBytes, p.logRetentionDays, int64(len(msg)+1), time.Now()); err != nil {
@@ -178,6 +199,45 @@ func (p *Printer) Printf(color, format string, a ...any) {
 	}
 }
 
+func (p *Printer) animate(msg string) {
+	if !p.color {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.live = msg
+	fmt.Fprint(p.consoleWriter(), "\r\033[2K", msg)
+}
+
+func (p *Printer) clearAnimation() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.live != "" {
+		fmt.Fprint(p.consoleWriter(), "\r\033[2K")
+		p.live = ""
+	}
+}
+
+func (p *Printer) progress(label, content string) {
+	if !p.color {
+		p.row(ansiGray, label, "%s", content)
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.writeLog(padRight(label, 12) + "  " + content)
+}
+
+// finishProgress 固定终端上的最终进度；文件日志已由里程碑输出负责。
+func (p *Printer) finishProgress(label, content string) {
+	if !p.color {
+		return
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	fmt.Fprintf(p.consoleWriter(), "%s%s  %s%s\n", ansiGray, padRight(label, 12), content, ansiReset)
+}
+
 func (p *Printer) Info(format string, a ...any)  { p.Printf("", format, a...) }
 func (p *Printer) Ok(format string, a ...any)    { p.Printf(ansiGreen, format, a...) }
 func (p *Printer) Warn(format string, a ...any)  { p.Printf(ansiYellow, format, a...) }
@@ -185,6 +245,37 @@ func (p *Printer) Err(format string, a ...any)   { p.Printf(ansiRed, format, a..
 func (p *Printer) Note(format string, a ...any)  { p.Printf(ansiCyan, format, a...) }
 func (p *Printer) Hint(format string, a ...any)  { p.Printf(ansiBlue, format, a...) }
 func (p *Printer) Muted(format string, a ...any) { p.Printf(ansiGray, format, a...) }
+
+// displayWidth 使用终端字符单元计算列宽，中文/全角字符占两列，组合符不占列。
+// 不使用制表符，保证重定向到文件后仍能按等宽字体阅读。
+func displayWidth(s string) int {
+	width := 0
+	for _, r := range s {
+		switch {
+		case unicode.IsControl(r), unicode.Is(unicode.Mn, r), unicode.Is(unicode.Me, r), unicode.Is(unicode.Cf, r):
+		case r >= 0x1100 && (r <= 0x115f || r == 0x2329 || r == 0x232a ||
+			(r >= 0x2e80 && r <= 0xa4cf && r != 0x303f) ||
+			(r >= 0xac00 && r <= 0xd7a3) || (r >= 0xf900 && r <= 0xfaff) ||
+			(r >= 0xfe10 && r <= 0xfe19) || (r >= 0xfe30 && r <= 0xfe6f) ||
+			(r >= 0xff01 && r <= 0xff60) || (r >= 0xffe0 && r <= 0xffe6) ||
+			(r >= 0x20000 && r <= 0x3fffd)):
+			width += 2
+		default:
+			width++
+		}
+	}
+	return width
+}
+
+func padRight(s string, width int) string {
+	return s + strings.Repeat(" ", max(0, width-displayWidth(s)))
+}
+
+// row 的内容统一从第 15 列开始，空标签用于表格续行。
+func (p *Printer) row(color, label, format string, args ...any) {
+	p.Printf(color, "%s  %s", padRight(label, 12), fmt.Sprintf(format, args...))
+}
+
 func (p *Printer) Close() {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -895,7 +986,7 @@ func (pc *PreCache) healthCheck(ctx context.Context) error {
 	case res.Class == ClassException:
 		return fmt.Errorf("健康检查失败：%s（%s），源站不可达或响应过慢，中止预热", u, res.Err)
 	}
-	pc.out.Info("健康检查  HTTP %d · %s", res.Status, formatDuration(res.Elapsed))
+	pc.out.row("", "健康检查", "HTTP %d · %s", res.Status, formatDuration(res.Elapsed))
 	return nil
 }
 
@@ -1406,8 +1497,9 @@ func (pc *PreCache) run(ctx context.Context, pages []Page, phase string) []Resul
 		workers = len(pages)
 	}
 
-	runStart := time.Now()
-	pc.out.Info("%s开始  共 %d 页", phase, len(pages))
+	pc.out.row("", phase+"开始", "共 %d 页", len(pages))
+	progress := newProgressDisplay(pc.out, phase, len(pages), 100*time.Millisecond)
+	defer progress.finish()
 
 	// 自适应降速：源站变慢时自动收窄并发，避免把访客挤掉
 	th := newThrottle(workers, pc.cfg.SlowRatio, pc.out)
@@ -1417,10 +1509,6 @@ func (pc *PreCache) run(ctx context.Context, pages []Page, phase string) []Resul
 				n, th.limitNow())
 		}
 	}()
-
-	// 用局部计数而不是结构体字段：复检会再调一次 run，累加会算出错的百分比
-	var progressMu sync.Mutex
-	done, nextPercent := 0, 25
 
 	for w := 0; w < workers; w++ {
 		wg.Add(1)
@@ -1441,15 +1529,8 @@ func (pc *PreCache) run(ctx context.Context, pages []Page, phase string) []Resul
 				results[idx] = res
 				th.observe(res.Elapsed)
 
-				if len(pages) >= 100 && res.Class != ClassSkipped {
-					progressMu.Lock()
-					done++
-					percent := done * 100 / len(pages)
-					if percent >= nextPercent {
-						pc.out.Muted("%s进度  %3d%% · %d/%d 页 · 已用 %s", phase, percent, done, len(pages), formatDuration(time.Since(runStart)))
-						nextPercent += 25
-					}
-					progressMu.Unlock()
+				if res.Class != ClassSkipped {
+					progress.advance()
 				}
 			}
 		}()
@@ -1467,6 +1548,105 @@ func (pc *PreCache) run(ctx context.Context, pages []Page, phase string) []Resul
 	close(jobs)
 	wg.Wait()
 	return results
+}
+
+// progressDisplay 在终端持续刷新动画，日志只在开始、每完成 25% 及结束时记录。
+// 每轮独立计数；finish 等待输出协程退出，避免进度穿插到结果摘要中。
+type progressDisplay struct {
+	mu          sync.Mutex
+	out         *Printer
+	phase       string
+	total       int
+	done        int
+	lastShown   int
+	nextPercent int
+	started     time.Time
+	frame       int
+	stop        chan struct{}
+	exited      chan struct{}
+}
+
+func newProgressDisplay(out *Printer, phase string, total int, interval time.Duration) *progressDisplay {
+	p := &progressDisplay{out: out, phase: phase, total: total, nextPercent: 25, started: time.Now(), stop: make(chan struct{}), exited: make(chan struct{})}
+	p.print()
+	p.animate()
+	go func() {
+		defer close(p.exited)
+		if !out.color {
+			<-p.stop
+			return
+		}
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ticker.C:
+				p.mu.Lock()
+				p.animate()
+				p.mu.Unlock()
+			case <-p.stop:
+				return
+			}
+		}
+	}()
+	return p
+}
+
+// 调用方持有 mu，或尚未启动协程。
+func (p *progressDisplay) print() {
+	p.out.progress(p.phase+"进度", p.content())
+	p.lastShown = p.done
+}
+
+func (p *progressDisplay) content() string {
+	percent := 0
+	if p.total > 0 {
+		percent = p.done * 100 / p.total
+	}
+	return fmt.Sprintf("%3d%% · %*d/%d 页 · 已用 %s", percent, len(strconv.Itoa(p.total)), p.done, p.total, time.Since(p.started).Round(time.Second))
+}
+
+func (p *progressDisplay) animate() {
+	if !p.out.color {
+		return
+	}
+	const barWidth = 16
+	filled := 0
+	if p.total > 0 {
+		filled = p.done * barWidth / p.total
+	}
+	spinner := []string{"⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"}
+	p.out.animate(fmt.Sprintf("%s  %s [%s%s] %s", padRight(p.phase+"进度", 12), spinner[p.frame%len(spinner)], strings.Repeat("=", filled), strings.Repeat("-", barWidth-filled), p.content()))
+	p.frame++
+}
+
+func (p *progressDisplay) advance() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.done++
+	percent := p.done * 100 / p.total
+	if percent >= p.nextPercent && p.done < p.total {
+		p.print()
+		// 小任务可能一次跨过多个阈值，只记录实际进度，不重复打印同一页数。
+		for p.nextPercent <= percent {
+			p.nextPercent += 25
+		}
+	}
+	if p.done == 1 {
+		p.animate()
+	}
+}
+
+func (p *progressDisplay) finish() {
+	close(p.stop)
+	<-p.exited
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.out.clearAnimation()
+	if p.done != p.lastShown {
+		p.print()
+	}
+	p.out.finishProgress(p.phase+"进度", p.content())
 }
 
 // ---------------------------------------------------------------------------
@@ -1605,14 +1785,14 @@ func (p *Printer) section(title string) {
 
 func (pc *PreCache) debugf(format string, args ...any) {
 	if pc.cfg.Debug {
-		pc.out.Muted("  [debug] "+format, args...)
+		pc.out.row(ansiGray, "[debug]", format, args...)
 	}
 }
 
 func (pc *PreCache) printOverview() {
 	pc.out.Info("")
-	pc.out.Note("pre-caching %s  ·  %s", version, pc.startTime.Format("2006-01-02 15:04:05"))
-	pc.out.Info("站点地图  %s", pc.cfg.Sitemap)
+	pc.out.row(ansiCyan, "开始执行时间", "%s", pc.startTime.Format("2006-01-02 15:04:05"))
+	pc.out.row("", "站点地图", "%s", pc.cfg.Sitemap)
 	method := "GET"
 	if pc.cfg.UseHead {
 		method = "HEAD"
@@ -1621,8 +1801,8 @@ func (pc *PreCache) printOverview() {
 	if pc.cfg.Rate == 0 {
 		rate = "不限速"
 	}
-	pc.out.Info("请求设置  %s · 并发 %d · 上限 %s · 超时 %v · 重试 %d 次", method, pc.cfg.Concurrency, rate, pc.cfg.Timeout, pc.cfg.Retries)
-	pc.out.Info("休息策略  最少 %v · 非 HIT 耗时 × %.1f（取较大值）", pc.cfg.Delay, pc.cfg.RestRatio)
+	pc.out.row("", "请求设置", "%s · 并发 %d · 上限 %s · 超时 %v · 重试 %d 次", method, pc.cfg.Concurrency, rate, pc.cfg.Timeout, pc.cfg.Retries)
+	pc.out.row("", "休息策略", "最少 %v · 非 HIT 耗时 × %.1f（取较大值）", pc.cfg.Delay, pc.cfg.RestRatio)
 	cache := pc.cfg.CacheHeader
 	if cache == "" {
 		cache = "未配置"
@@ -1631,18 +1811,18 @@ func (pc *PreCache) printOverview() {
 	if pc.cfg.Recheck > 0 {
 		recheck = fmt.Sprintf("首轮结束后等待 %v", pc.cfg.Recheck)
 	}
-	pc.out.Info("缓存检测  %s · 复检 %s", cache, recheck)
+	pc.out.row("", "缓存检测", "%s · 复检 %s", cache, recheck)
 	if pc.cfg.Host != "" {
-		pc.out.Info("访问主机  %s · Host %s", pc.cfg.Host, pc.domain)
+		pc.out.row("", "访问主机", "%s · Host %s", pc.cfg.Host, pc.domain)
 	}
 	if pc.cfg.Rate == 0 {
-		pc.out.Warn("注意      全局限速已关闭")
+		pc.out.row(ansiYellow, "注意", "全局限速已关闭")
 	}
 	if pc.cfg.MaxLatency == 0 {
-		pc.out.Warn("注意      慢响应及首次超时保护已关闭")
+		pc.out.row(ansiYellow, "注意", "慢响应及首次超时保护已关闭")
 	}
 	if pc.cfg.MaxFail == 0 {
-		pc.out.Warn("注意      连续失败熔断已关闭")
+		pc.out.row(ansiYellow, "注意", "连续失败熔断已关闭")
 	}
 	pc.debugf("保护：慢响应阈值 %v · 冷却 %v · 连续慢响应 %d 次 · 连续失败 %d 次", pc.cfg.MaxLatency, pc.cfg.Cooldown, pc.cfg.MaxSlow, pc.cfg.MaxFail)
 	pc.debugf("自适应降速：基线 × %.1f（0 关闭）；首次超时中止由慢响应保护控制", pc.cfg.SlowRatio)
@@ -1660,24 +1840,35 @@ func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, inc
 	if elapsed > 0 {
 		speed = float64(completed) / elapsed.Seconds()
 	}
-	pc.out.Info("页面统计  %d/%d 页 · 耗时 %s · %.1f 页/s", completed, s.Total, formatDuration(elapsed), speed)
+	pc.out.row("", "页面统计", "%d/%d 页 · 耗时 %s · %.1f 页/s", completed, s.Total, formatDuration(elapsed), speed)
 	if pc.cfg.CacheHeader != "" {
 		if hitRate, total := s.hitRate(); total > 0 && includeRate {
-			pc.out.Ok("直接命中  %.1f%% (%d/%d，仅 HIT)", hitRate, s.Hit, total)
+			pc.out.row(ansiGreen, "直接命中", "%.1f%% (%d/%d，仅 HIT)", hitRate, s.Hit, total)
 		}
-		parts := []string{fmt.Sprintf("HIT %d", s.Hit)}
-		for _, item := range []struct {
+		type cacheCount struct {
 			label string
 			n     int
-		}{
+		}
+		items := []cacheCount{{"HIT", s.Hit}}
+		for _, item := range []cacheCount{
 			{"MISS", s.Miss}, {"EXPIRED", s.Expired}, {"STALE", s.Stale},
 			{"UPDATING", s.Updating}, {"REVALIDATED", s.Revalidated},
 		} {
 			if item.n > 0 {
-				parts = append(parts, fmt.Sprintf("%s %d", item.label, item.n))
+				items = append(items, item)
 			}
 		}
-		// 每行最多三个状态，避免窄终端下长行换行。
+		// 每行三个状态；同列的名称左对齐、数量右对齐，续行沿用内容缩进。
+		var widths [3]int
+		numberWidth := 1
+		for i, item := range items {
+			widths[i%3] = max(widths[i%3], displayWidth(item.label))
+			numberWidth = max(numberWidth, len(strconv.Itoa(item.n)))
+		}
+		parts := make([]string, len(items))
+		for i, item := range items {
+			parts[i] = fmt.Sprintf("%s %*d", padRight(item.label, widths[i%3]), numberWidth, item.n)
+		}
 		for i := 0; i < len(parts); i += 3 {
 			end := i + 3
 			if end > len(parts) {
@@ -1685,15 +1876,15 @@ func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, inc
 			}
 			label := "缓存状态"
 			if i > 0 {
-				label = "        "
+				label = ""
 			}
-			pc.out.Info("%s  %s", label, strings.Join(parts[i:end], " · "))
+			pc.out.row("", label, "%s", strings.Join(parts[i:end], " · "))
 		}
 		if s.Uncacheable > 0 || s.NoHeader > 0 {
-			pc.out.Warn("其他响应  不可缓存 %d · 无缓存头 %d", s.Uncacheable, s.NoHeader)
+			pc.out.row(ansiYellow, "其他响应", "不可缓存 %d · 无缓存头 %d", s.Uncacheable, s.NoHeader)
 		}
 		if pc.cfg.UseHead && s.Uncacheable > 0 && s.Hit == 0 && s.recheckCount() == 0 {
-			pc.out.Warn("提示      HEAD 可能无法建立缓存，建议使用 GET")
+			pc.out.row(ansiYellow, "提示", "HEAD 可能无法建立缓存，建议使用 GET")
 		}
 		if pc.cfg.Debug {
 			if s.Stale+s.Updating > 0 {
@@ -1712,17 +1903,17 @@ func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, inc
 			}
 		}
 	} else {
-		pc.out.Muted("缓存检测  未配置缓存头，仅统计 HTTP 状态")
+		pc.out.row(ansiGray, "缓存检测", "未配置缓存头，仅统计 HTTP 状态")
 	}
 	pc.printStatusCodes(s)
 	if s.NotFound+s.HTTPError+s.Exception+s.Skipped > 0 {
-		pc.out.Warn("异常统计  404/410 %d · HTTP 错误 %d · 网络异常 %d · 未执行 %d", s.NotFound, s.HTTPError, s.Exception, s.Skipped)
+		pc.out.row(ansiYellow, "异常统计", "404/410 %d · HTTP 错误 %d · 网络异常 %d · 未执行 %d", s.NotFound, s.HTTPError, s.Exception, s.Skipped)
 	}
 	if s.Retried > 0 {
-		pc.out.Muted("重试页面  %d", s.Retried)
+		pc.out.row(ansiGray, "重试页面", "%d", s.Retried)
 	}
 	if blocked := s.blocked(); blocked > 0 && blocked*4 >= s.Total {
-		pc.out.Warn("访问受限  %d 页返回 403/429/503；检查 WAF、限流和源站负载", blocked)
+		pc.out.row(ansiYellow, "访问受限", "%d 页返回 403/429/503；检查 WAF、限流和源站负载", blocked)
 	}
 }
 
@@ -1742,14 +1933,14 @@ func (pc *PreCache) printCompletion(code int, err error) {
 			status = "执行失败"
 		}
 	}
-	line := fmt.Sprintf("%s  %s · 总耗时 %s · 退出码 %d", status, time.Now().Format("15:04:05"), formatDuration(time.Since(pc.startTime)), code)
+	line := fmt.Sprintf("%s · %s · 总耗时 %s · 退出码 %d", status, time.Now().Format("15:04:05"), formatDuration(time.Since(pc.startTime)), code)
 	if code == 0 {
-		pc.out.Ok("%s", line)
+		pc.out.row(ansiGreen, "执行结果", "%s", line)
 	} else {
-		pc.out.Warn("%s", line)
+		pc.out.row(ansiYellow, "执行结果", "%s", line)
 	}
 	if err != nil {
-		pc.out.Err("原因      %v", err)
+		pc.out.row(ansiRed, "原因", "%v", err)
 	}
 }
 
@@ -1762,17 +1953,20 @@ func (pc *PreCache) printFailures(s Stats) {
 		limit = 20
 	}
 	pc.out.section("失败明细")
-	pc.out.Warn("共 %d 页，最多显示 %d 页", len(s.Failures), limit)
+	pc.out.row(ansiYellow, "失败页面", "共 %d 页，最多显示 %d 页", len(s.Failures), limit)
 	for i, r := range s.Failures {
 		if i >= limit {
-			pc.out.Muted("  其余 %d 页可通过 -json 导出完整明细", len(s.Failures)-limit)
+			pc.out.row(ansiGray, "", "其余 %d 页可通过 -json 导出完整明细", len(s.Failures)-limit)
 			break
 		}
 		reason := r.Err
 		if reason == "" && r.Status > 0 {
 			reason = fmt.Sprintf("HTTP %d", r.Status)
 		}
-		pc.out.Muted("  [%s] %s %s", r.Class, r.Page.RawURL, reason)
+		pc.out.row(ansiGray, "["+r.Class.String()+"]", "%s", r.Page.RawURL)
+		if reason != "" {
+			pc.out.row(ansiGray, "", "%s", reason)
+		}
 	}
 }
 
@@ -1806,13 +2000,13 @@ func (pc *PreCache) printSlowest(results []Result) {
 		return
 	}
 	pc.out.section("慢页面")
-	pc.out.Info("最慢 %d 页 · 阈值 >%v · 包含所有超时", len(rs), pc.cfg.SlowThreshold)
+	pc.out.row("", "慢页面统计", "最慢 %d 页 · 阈值 >%v · 包含所有超时", len(rs), pc.cfg.SlowThreshold)
 	for _, r := range rs {
 		mark := ""
 		if r.Timeout {
 			mark = "  ← 超时"
 		}
-		pc.out.Warn("  %8v  %s%s", r.Elapsed.Round(10*time.Millisecond), r.Page.RawURL, mark)
+		pc.out.row(ansiYellow, "响应耗时", "%8v · %s%s", r.Elapsed.Round(10*time.Millisecond), r.Page.RawURL, mark)
 	}
 }
 
@@ -1828,9 +2022,9 @@ func (pc *PreCache) printStatusCodes(s Stats) {
 
 	parts := make([]string, 0, len(codes))
 	for _, c := range codes {
-		parts = append(parts, fmt.Sprintf("%d×%d", c, s.StatusCodes[c]))
+		parts = append(parts, fmt.Sprintf("%d × %d", c, s.StatusCodes[c]))
 	}
-	pc.out.Info("HTTP 状态 %s", strings.Join(parts, " · "))
+	pc.out.row("", "HTTP状态", "%s", strings.Join(parts, " · "))
 }
 
 // ---------------------------------------------------------------------------
@@ -1990,7 +2184,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		learned[u] = true
 	}
 	if len(learned) > 0 {
-		pc.out.Muted("已从学习文件加载 %d 个历史超时页面（本次自动排除）", len(learned))
+		pc.out.row(ansiGray, "历史记录", "%d 个历史超时页面（本次自动排除）", len(learned))
 	}
 
 	// 预热前健康检查：源站已经故障时直接退出，不往故障上压请求
@@ -2012,7 +2206,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	if len(pages) == 0 && !(pc.cfg.LastMod > 0 && pc.discovered > 0) {
 		return 1, fmt.Errorf("未从 sitemap 中提取到任何页面，请检查 sitemap 是否符合规范或 -lastmod 过滤是否过严")
 	}
-	pc.out.Info("页面发现  %d 页（已去重）", len(pages))
+	pc.out.row("", "页面发现", "%d 页（已去重）", len(pages))
 	if len(pages) == 0 {
 		pc.out.Ok("增量检查完成：没有最近变更的页面，无需预热")
 	}
@@ -2039,16 +2233,16 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		}
 		if n := len(pages) - len(kept); n > 0 {
 			pages = kept
-			pc.out.Warn("已按手动规则 / 学习记录排除 %d 个页面，例如：", n)
+			pc.out.row(ansiYellow, "排除页面", "共 %d 页（手动规则 / 学习记录），例如：", n)
 			for _, u := range excluded {
-				pc.out.Muted("  排除 %s", u)
+				pc.out.row(ansiGray, "", "%s", u)
 			}
 		}
 	}
 
 	// 灰度：先只跑前 N 个页面观察源站负载，确认没问题再放开全量
 	if pc.cfg.Limit > 0 && len(pages) > pc.cfg.Limit {
-		pc.out.Warn("已启用 -limit=%d：本次只处理前 %d 个页面，其余 %d 个跳过",
+		pc.out.row(ansiYellow, "数量限制", "-limit=%d：本次只处理前 %d 个页面，其余 %d 个跳过",
 			pc.cfg.Limit, pc.cfg.Limit, len(pages)-pc.cfg.Limit)
 		pages = pages[:pc.cfg.Limit]
 	}
@@ -2072,7 +2266,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 	var rc *jsonRecheck
 	if pc.cfg.Recheck > 0 && stats.recheckCount() > 0 && ctx.Err() == nil && !pc.aborted() {
 		pc.out.section("复检")
-		pc.out.Info("复检准备  %d 页待确认 · 等待 %v", stats.recheckCount(), pc.cfg.Recheck)
+		pc.out.row("", "复检准备", "%d 页待确认 · 等待 %v", stats.recheckCount(), pc.cfg.Recheck)
 		sleep(ctx, pc.cfg.Recheck)
 
 		var recheckPages []Page
@@ -2086,10 +2280,10 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		reStats := summarize(reResults)
 		pc.printStats(reStats, time.Since(reStart), "复检结果", false)
 		rate := float64(reStats.Hit) / float64(len(recheckPages)) * 100
-		pc.out.Info("复检命中  %.1f%% (%d/%d，仅 HIT)", rate, reStats.Hit, len(recheckPages))
-		pc.out.Muted("复检范围  仅首轮待确认页面")
+		pc.out.row("", "复检命中", "%.1f%% (%d/%d，仅 HIT)", rate, reStats.Hit, len(recheckPages))
+		pc.out.row(ansiGray, "复检范围", "仅首轮待确认页面")
 		if reStats.Hit < len(recheckPages) {
-			pc.out.Warn("待确认    %d 页未直接 HIT（含错误及未执行），见上方状态",
+			pc.out.row(ansiYellow, "待确认", "%d 页未直接 HIT（含错误及未执行），见上方状态",
 				len(recheckPages)-reStats.Hit)
 		}
 		rc = &jsonRecheck{
@@ -2118,9 +2312,9 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		}
 		pc.printFailures(reStats)
 	} else if pc.cfg.Recheck == 0 && stats.recheckCount() > 0 {
-		pc.out.Muted("复检状态  未启用 · %d 页待确认，可用 -recheck=5s 验证", stats.recheckCount())
+		pc.out.row(ansiGray, "复检状态", "未启用 · %d 页待确认，可用 -recheck=5s 验证", stats.recheckCount())
 	} else if pc.cfg.Recheck > 0 && stats.recheckCount() == 0 && ctx.Err() == nil && !pc.aborted() {
-		pc.out.Muted("复检状态  无待确认页面，已跳过")
+		pc.out.row(ansiGray, "复检状态", "无待确认页面，已跳过")
 	}
 
 	// 更新每日观察记录，连续多天超时的 URL 才记入 slow-pages.txt。
@@ -2142,7 +2336,7 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 			}
 			return 1, fmt.Errorf("写入 JSON 报告失败：%w", err)
 		}
-		pc.out.Info("JSON 报告 %s", pc.cfg.JSONPath)
+		pc.out.row("", "JSON报告", "%s", pc.cfg.JSONPath)
 	}
 	return code, nil
 }
