@@ -19,6 +19,183 @@ import (
 	"time"
 )
 
+func TestCacheStatusClassification(t *testing.T) {
+	for _, tt := range []struct {
+		raw  string
+		want Class
+	}{
+		{"", ClassNoHeader}, {"  ", ClassNoHeader}, {"hit", ClassHit},
+		{"MISS", ClassMiss}, {"TCP_MISS", ClassMiss}, {"TCP_MEM_HIT", ClassHit},
+		{"EXPIRED", ClassExpired}, {"STALE", ClassStale}, {"UPDATING", ClassUpdating},
+		{"REVALIDATED", ClassRevalidated}, {"BYPASS", ClassUncacheable},
+		{"DYNAMIC", ClassUncacheable}, {"NOT_HIT", ClassUncacheable},
+		{"HIT, MISS", ClassMiss}, {"MISS, HIT", ClassHit}, {"HIT, BYPASS", ClassUncacheable},
+	} {
+		if got := classifyCache(tt.raw); got != tt.want {
+			t.Errorf("%q: got %s, want %s", tt.raw, got, tt.want)
+		}
+	}
+}
+
+func TestCacheStatisticsAndRecheck(t *testing.T) {
+	states := []string{"HIT", "MISS", "EXPIRED", "STALE", "UPDATING", "REVALIDATED"}
+	var mu sync.Mutex
+	visits := make(map[string]int)
+	var server *httptest.Server
+	server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/sitemap.xml":
+			fmt.Fprint(w, "<urlset>")
+			for _, state := range states {
+				fmt.Fprintf(w, "<url><loc>%s/%s</loc></url>", server.URL, state)
+			}
+			fmt.Fprint(w, "</urlset>")
+		case "/":
+			w.Header().Set("X-Cache", "HIT")
+		default:
+			state := strings.TrimPrefix(r.URL.Path, "/")
+			mu.Lock()
+			visits[state]++
+			n := visits[state]
+			mu.Unlock()
+			if n > 1 && state != "STALE" {
+				state = "HIT"
+			}
+			w.Header().Set("X-Cache", state)
+		}
+	}))
+	defer server.Close()
+	reportPath := filepath.Join(t.TempDir(), "report.json")
+	pc := newTestCache(t, Config{Sitemap: server.URL + "/sitemap.xml", CacheHeader: "X-Cache", Recheck: time.Millisecond, JSONPath: reportPath})
+	logPath := filepath.Join(t.TempDir(), "output.log")
+	pc.out = newPrinter(logPath, 5<<20, 7)
+	defer pc.out.Close()
+	if code, err := pc.Start(context.Background()); code != 0 || err != nil {
+		t.Fatalf("code=%d, err=%v", code, err)
+	}
+	data, err := os.ReadFile(reportPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var report jsonReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		t.Fatal(err)
+	}
+	for _, state := range states {
+		if report.Counts[strings.ToLower(state)] != 1 || report.CacheStatuses[state] != 1 {
+			t.Errorf("lost original %s: %+v", state, report)
+		}
+	}
+	if math.Abs(report.FirstPassHitRate-100.0/6) > 1e-9 || report.HitRate != report.FirstPassHitRate {
+		t.Fatalf("first pass rate=%v", report.FirstPassHitRate)
+	}
+	rc := report.Recheck
+	if rc == nil || rc.Total != 5 || rc.Hit != 4 || rc.Stale != 1 || rc.Miss != 0 || rc.NotHit != 1 || rc.HitRate != 80 || rc.CacheStatuses["STALE"] != 1 {
+		t.Fatalf("wrong recheck: %+v", rc)
+	}
+	if visits["HIT"] != 1 {
+		t.Fatal("already HIT page was rechecked")
+	}
+	logData, err := os.ReadFile(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, text := range []string{"首轮请求直接命中率", "旧缓存响应 (STALE)", "原始缓存头分布", "预热后复检命中率", "80.0% (4/5)"} {
+		if !strings.Contains(string(logData), text) {
+			t.Errorf("missing %q in log", text)
+		}
+	}
+}
+
+func TestLogRotationAndExpiry(t *testing.T) {
+	now := time.Now()
+	for _, tt := range []struct {
+		name   string
+		age    time.Duration
+		max    int64
+		backup bool
+	}{
+		{"size", 0, 4, true}, {"daily", 25 * time.Hour, 1024, true},
+		{"expired", 8 * 24 * time.Hour, 1024, false},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "pre cache.log")
+			if err := os.WriteFile(path, []byte("old content\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			modified := now.Add(-tt.age)
+			if err := os.Chtimes(path, modified, modified); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.Stat(path)
+			p := newPrinter(path, tt.max, 7)
+			defer p.Close()
+			p.Info("new")
+			after, _ := os.Stat(path)
+			if !os.SameFile(before, after) {
+				t.Fatal("active inode changed")
+			}
+			data, err := os.ReadFile(path)
+			if err != nil || string(data) != "new\n" {
+				t.Fatalf("active log=%q err=%v", data, err)
+			}
+			data, err = os.ReadFile(path + ".1")
+			if tt.backup {
+				if err != nil || string(data) != "old content\n" {
+					t.Fatalf("backup=%q err=%v", data, err)
+				}
+				info, _ := os.Stat(path + ".1")
+				if info.Mode().Perm() != 0600 || !info.ModTime().Equal(before.ModTime()) {
+					t.Fatal("backup metadata lost")
+				}
+			} else if !os.IsNotExist(err) {
+				t.Fatalf("expired content archived: %q %v", data, err)
+			}
+		})
+	}
+}
+
+func TestLogRotationDuringWritesAndCleanup(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-cache.log")
+	p := newPrinter(path, 8, 7)
+	defer p.Close()
+	for _, line := range []string{"one", "two", "three", "four"} {
+		p.Info("%s", line)
+	}
+	data, _ := os.ReadFile(path)
+	backup, _ := os.ReadFile(path + ".1")
+	if string(data) != "four\n" || string(backup) != "three\n" {
+		t.Fatalf("current=%q backup=%q", data, backup)
+	}
+	old := time.Now().Add(-8 * 24 * time.Hour)
+	if err := os.Chtimes(path+".1", old, old); err != nil {
+		t.Fatal(err)
+	}
+	p.Info("x")
+	if _, err := os.Stat(path + ".1"); !os.IsNotExist(err) {
+		t.Fatal("expired backup remains")
+	}
+	p.Close()
+	p.Info("after close") // 不再写入已关闭句柄。
+}
+
+func TestLogRotationFailureKeepsOriginal(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "pre-cache.log")
+	if err := os.WriteFile(path, []byte("old\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(path+".1", 0700); err != nil {
+		t.Fatal(err)
+	}
+	p := newPrinter(path, 4, 7)
+	defer p.Close()
+	p.Info("new")
+	data, _ := os.ReadFile(path)
+	if string(data) != "old\nnew\n" {
+		t.Fatalf("rotation failure lost data: %q", data)
+	}
+}
+
 func learningCache(t *testing.T, path string) *PreCache {
 	t.Helper()
 	return &PreCache{cfg: Config{LearnPath: path}, out: &Printer{}}

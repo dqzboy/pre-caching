@@ -26,7 +26,7 @@ if [[ -f "$ENV_FILE" ]]; then
     for _v in SITEMAP_URL CACHE_HEADER CONCURRENCY TIMEOUT DELAY RATE RETRY RECHECK \
               LASTMOD JSON_OUT MAX_ERROR_RATE VERIFY_SSL EXTRA_ARGS LOG_FILE CRON_LOG \
               MAX_FAIL SLOW_RATIO SLOW_THRESHOLD MAX_LATENCY COOLDOWN MAX_SLOW REST_RATIO LIMIT EXCLUDE NO_LEARN LEARN_FILE \
-              LOG_MAX_BYTES LOCK_FILE; do
+              LOG_MAX_BYTES LOG_RETENTION_DAYS LOCK_FILE; do
         [[ "${!_v+x}" == x ]] && _PRESET+=("${_v}=${!_v}")
     done
 
@@ -73,9 +73,19 @@ EXTRA_ARGS="${EXTRA_ARGS:-}"                # 追加参数，例如 "-host=10.0.
 
 LOG_FILE="${LOG_FILE:-$SCRIPT_DIR/pre-cache.log}"
 CRON_LOG="${CRON_LOG:-$SCRIPT_DIR/cron.log}"
-LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"   # cron.log 超过 5MB 自动轮转
+LOG_MAX_BYTES="${LOG_MAX_BYTES:-5242880}"   # 两种日志每天或达到 5MiB 轮转，仅保留 .1
+LOG_RETENTION_DAYS="${LOG_RETENTION_DAYS:-7}" # 清理超过此天数未修改的日志文件
 LOCK_FILE="${LOCK_FILE:-$SCRIPT_DIR/.precache.lock}"
 LOCK_DIR="${LOCK_FILE}.d"
+
+if [[ ! "$LOG_MAX_BYTES" =~ ^[0-9]{1,15}$ ]] || (( 10#$LOG_MAX_BYTES < 1 )) ||
+   [[ ! "$LOG_RETENTION_DAYS" =~ ^[0-9]{1,5}$ ]] ||
+   (( 10#$LOG_RETENTION_DAYS < 1 || 10#$LOG_RETENTION_DAYS > 36500 )); then
+    echo "错误: LOG_MAX_BYTES 必须是正整数，LOG_RETENTION_DAYS 必须在 1 到 36500 之间" >&2
+    exit 1
+fi
+LOG_MAX_BYTES=$((10#$LOG_MAX_BYTES))
+LOG_RETENTION_DAYS=$((10#$LOG_RETENTION_DAYS))
 
 # ---------------------------------------------------------------------------
 # 配置自检：SITEMAP_URL 还是占位地址时直接报错
@@ -136,18 +146,19 @@ chmod +x "$EXECUTABLE" 2>/dev/null
 # 用 -version 的输出来判定，而不是解析 -h 的 usage 文本：
 #   - 解析 usage 依赖参数名，参数一改就失效
 #   - `cmd | grep -q` 在 pipefail 下可能因 SIGPIPE 误判为失败
-# 脚本会传 -max-latency 等 v2.7 才有的参数，旧版二进制遇到未知参数
+# 脚本会传 -log-retention-days 等 v2.7.1 才有的参数，旧版二进制遇到未知参数
 # 只会打一行 "flag provided but not defined" 然后退出 2，很难定位。
 # ---------------------------------------------------------------------------
 VERSION_LINE="$("$EXECUTABLE" -version 2>&1 || true)"
 VERSION_LINE="${VERSION_LINE%%$'\n'*}"
 
 version_supported() {
-    local major minor
+    local major minor patch
     if [[ "$VERSION_LINE" =~ ^pre-caching\ ([0-9]+)\.([0-9]+)\.([0-9]+)$ ]]; then
         major="${BASH_REMATCH[1]}"
         minor="${BASH_REMATCH[2]}"
-        (( 10#$major > 2 || (10#$major == 2 && 10#$minor >= 7) ))
+        patch="${BASH_REMATCH[3]}"
+        (( 10#$major > 2 || (10#$major == 2 && (10#$minor > 7 || (10#$minor == 7 && 10#$patch >= 1))) ))
         return $?
     fi
     return 1
@@ -156,15 +167,15 @@ version_supported() {
 if ! version_supported; then
     FILE_INFO="$(ls -l "$EXECUTABLE" 2>/dev/null | awk '{print $5" 字节, 修改时间 "$6" "$7" "$8}')"
     cat >&2 <<EOF
-错误: $EXECUTABLE 版本过旧或格式无效，当前脚本需要 v2.7.0 及以上版本
+错误: $EXECUTABLE 版本过旧或格式无效，当前脚本需要 v2.7.1 及以上版本
       -version 实际输出: ${VERSION_LINE:-<空>}
       文件信息: ${FILE_INFO:-<无法读取>}
       文件类型: $(file -b "$EXECUTABLE" 2>/dev/null | cut -c1-60)
 
-      当前脚本使用 -max-latency 等压力保护参数，需要 pre-caching v2.7.0 及以上版本。请在部署目录下执行：
+      当前脚本使用日志轮转参数，需要 pre-caching v2.7.1 及以上版本。请在部署目录下执行：
 
         ls -l $EXECUTABLE
-        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching 2.7.0 或更新版本
+        ./${EXECUTABLE#./} -version      # 期望输出: pre-caching 2.7.1 或更新版本
 
       若上面显示的还是旧内容，说明上传没有覆盖成功（常见原因：上传到了
       另一个目录、文件名不一致、或旧进程仍占用文件）。重新编译并上传：
@@ -174,8 +185,6 @@ if ! version_supported; then
 EOF
     exit 1
 fi
-
-echo "二进制版本: $VERSION_LINE"
 
 # ---------------------------------------------------------------------------
 # 防重叠执行：上一次还没跑完就跳过本次，避免压力叠加
@@ -228,13 +237,23 @@ acquire_lock() {
 # 日志轮转
 # ---------------------------------------------------------------------------
 rotate_log() {
+    local expired_minutes=$((LOG_RETENTION_DAYS * 1440))
+    # cron 会在脚本启动前打开追加描述符，因此只截断当前文件，不能删除或改名。
+    if [[ -f "${CRON_LOG}.1" ]]; then
+        find "${CRON_LOG}.1" -type f -mmin "+$expired_minutes" -exec rm -f -- {} \; || return 1
+    fi
     [[ -f "$CRON_LOG" ]] || return 0
-    local size
+    if [[ -n "$(find "$CRON_LOG" -type f -mmin "+$expired_minutes" -print -quit)" ]]; then
+        : > "$CRON_LOG" || return 1
+        return 0
+    fi
+    local size previous_day
     size=$(wc -c < "$CRON_LOG" 2>/dev/null | tr -d ' ')
     [[ -z "$size" ]] && return 0
-    if (( size > LOG_MAX_BYTES )); then
+    previous_day="$(find "$CRON_LOG" ! -newermt "$(date '+%F')" -print -quit)"
+    if (( size > 0 )) && { (( size >= LOG_MAX_BYTES )) || [[ -n "$previous_day" ]]; }; then
         # 保留当前文件的 inode，使 cron 提前打开的追加描述符继续写当前日志。
-        if ! cp -f "$CRON_LOG" "${CRON_LOG}.1"; then
+        if ! cp -pf "$CRON_LOG" "${CRON_LOG}.1"; then
             echo "警告: 无法轮转日志 $CRON_LOG" >&2
             return 1
         fi
@@ -249,6 +268,7 @@ rotate_log() {
 acquire_lock
 rotate_log
 
+echo "二进制版本: $VERSION_LINE"
 echo "========================================="
 echo "开始执行预缓存任务: $(date '+%F %T')"
 echo "可执行文件: $EXECUTABLE"
@@ -261,6 +281,8 @@ ARGS=(
     --delay="$DELAY"
     --retry="$RETRY"
     --log="$LOG_FILE"
+    --log-max-bytes="$LOG_MAX_BYTES"
+    --log-retention-days="$LOG_RETENTION_DAYS"
     --slow-threshold="$SLOW_THRESHOLD"
     --max-latency="$MAX_LATENCY"
     --cooldown="$COOLDOWN"

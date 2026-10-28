@@ -22,7 +22,8 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 #           用 5 而不是 0，是为了避开整点高峰
 # LASTMOD=2h  只预热 sitemap 里 lastmod 在最近 2 小时内变更的页面，
 #             缺少 lastmod 的页面仍会请求，WordPress 可能因此变成全量；先检查日志。
-# 日志：追加写入 cron.log，超过 5MB 自动轮转为 cron.log.1
+# 日志：追加写入 cron.log，跨天或达到 5MiB 轮转为 cron.log.1，仅保留一份备份
+#       每次运行清理超过 7 天未修改的日志文件，LOG_RETENTION_DAYS 可调整
 # ---------------------------------------------------------------------------
 #5 * * * * LASTMOD=2h /bin/bash /opt/pre-caching/run_precache.sh >> /opt/pre-caching/cron.log 2>&1
 

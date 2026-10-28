@@ -35,7 +35,7 @@ import (
 
 // version 版本号。run_precache.sh 会通过 -version 输出判断二进制是否过旧，
 // 因此修改版本号输出格式时请同步检查脚本的版本自检逻辑。
-const version = "2.7.0"
+const version = "2.7.1"
 
 // 预缓存的目标是"像真实访客那样把页面打进缓存"，所以默认请求头按浏览器构造：
 //   - UA 用常见浏览器串：大量 WAF / Bot 管理（Cloudflare SBFM、云厂商 WAF、
@@ -63,13 +63,15 @@ const (
 
 // Printer 串行化并发输出，同时写控制台与日志文件。
 type Printer struct {
-	mu    sync.Mutex
-	file  *os.File
-	color bool
+	mu               sync.Mutex
+	file             *os.File
+	color            bool
+	logMaxBytes      int64
+	logRetentionDays int
 }
 
-func newPrinter(logPath string) *Printer {
-	p := &Printer{color: isTerminal()}
+func newPrinter(logPath string, maxBytes int64, retentionDays int) *Printer {
+	p := &Printer{color: isTerminal(), logMaxBytes: maxBytes, logRetentionDays: retentionDays}
 	if logPath != "" {
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
 		if err != nil {
@@ -77,9 +79,71 @@ func newPrinter(logPath string) *Printer {
 			fmt.Fprintf(os.Stderr, "警告：无法写入日志文件 %s：%v（仅输出到控制台）\n", logPath, err)
 		} else {
 			p.file = f
+			if err := maintainLog(f, maxBytes, retentionDays, 0, time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "警告：日志轮转失败 %s：%v\n", logPath, err)
+			}
 		}
 	}
 	return p
+}
+
+// maintainLog 每天或达到大小阈值时轮转，仅保留 .1；过期文件按修改时间清理。
+// 复制后截断保留 inode，兼容外部重定向到相同路径；失败时不截断原日志。
+func maintainLog(f *os.File, maxBytes int64, retentionDays int, incoming int64, now time.Time) error {
+	path := f.Name()
+	backup := path + ".1"
+	retention := time.Duration(retentionDays) * 24 * time.Hour
+	if info, err := os.Stat(backup); err == nil {
+		if now.Sub(info.ModTime()) >= retention {
+			if err := os.Remove(backup); err != nil {
+				return err
+			}
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	}
+	info, err := f.Stat()
+	if err != nil {
+		return err
+	}
+	if info.Size() == 0 {
+		return nil
+	}
+	if now.Sub(info.ModTime()) >= retention {
+		return f.Truncate(0)
+	}
+	sameDay := info.ModTime().In(now.Location()).Format("2006-01-02") == now.Format("2006-01-02")
+	if sameDay && info.Size() < maxBytes && incoming <= maxBytes-info.Size() {
+		return nil
+	}
+	source, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer source.Close()
+	tmp, err := os.CreateTemp(filepath.Dir(path), ".precache-log-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmp.Name())
+	_, copyErr := io.Copy(tmp, source)
+	if copyErr == nil {
+		copyErr = tmp.Chmod(info.Mode().Perm())
+	}
+	closeErr := tmp.Close()
+	if copyErr != nil {
+		return copyErr
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	if err := os.Chtimes(tmp.Name(), info.ModTime(), info.ModTime()); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp.Name(), backup); err != nil {
+		return err
+	}
+	return f.Truncate(0)
 }
 
 func isTerminal() bool {
@@ -105,6 +169,11 @@ func (p *Printer) Printf(color, format string, a ...any) {
 		fmt.Println(msg)
 	}
 	if p.file != nil {
+		if p.logMaxBytes > 0 && p.logRetentionDays > 0 {
+			if err := maintainLog(p.file, p.logMaxBytes, p.logRetentionDays, int64(len(msg)+1), time.Now()); err != nil {
+				fmt.Fprintf(os.Stderr, "警告：日志轮转失败 %s：%v\n", p.file.Name(), err)
+			}
+		}
 		_, _ = p.file.WriteString(msg + "\n")
 	}
 }
@@ -121,6 +190,7 @@ func (p *Printer) Close() {
 	defer p.mu.Unlock()
 	if p.file != nil {
 		p.file.Close()
+		p.file = nil
 	}
 }
 
@@ -141,6 +211,10 @@ const (
 	ClassHTTPError
 	ClassException
 	ClassUnclassified // 已成功请求，但未配置 -cacheheader，不做缓存分类
+	ClassExpired
+	ClassStale
+	ClassUpdating
+	ClassRevalidated
 )
 
 func (c Class) String() string {
@@ -149,6 +223,14 @@ func (c Class) String() string {
 		return "HIT"
 	case ClassMiss:
 		return "MISS"
+	case ClassExpired:
+		return "EXPIRED"
+	case ClassStale:
+		return "STALE"
+	case ClassUpdating:
+		return "UPDATING"
+	case ClassRevalidated:
+		return "REVALIDATED"
 	case ClassUncacheable:
 		return "不可缓存"
 	case ClassNoHeader:
@@ -167,27 +249,46 @@ func (c Class) String() string {
 }
 
 // classifyCache 解析缓存标识头的值。
-// 顺序很重要：先判 HIT，再判各类 MISS（含 TCP_MISS / REVALIDATED / STALE 等需要重新预热的态）。
+// 保留缓存状态含义；多层缓存响应按最后一个可识别状态分类，原始头另行统计。
 func classifyCache(raw string) Class {
-	if raw == "" {
+	if strings.TrimSpace(raw) == "" {
 		return ClassNoHeader
 	}
-	u := strings.ToUpper(raw)
-
-	switch {
-	case strings.Contains(u, "HIT"):
-		return ClassHit
-	case strings.Contains(u, "MISS"),
-		strings.Contains(u, "EXPIRED"),
-		strings.Contains(u, "REVALIDATED"),
-		strings.Contains(u, "STALE"),
-		strings.Contains(u, "UPDATING"),
-		strings.Contains(u, "TCP_MISS"):
-		return ClassMiss
-	default:
-		// BYPASS / DYNAMIC / PASS / NONE 等，确实不会被缓存
-		return ClassUncacheable
+	class := ClassUncacheable
+	for _, token := range strings.FieldsFunc(strings.ToUpper(raw), func(r rune) bool {
+		return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_')
+	}) {
+		switch token {
+		case "HIT":
+			class = ClassHit
+		case "MISS":
+			class = ClassMiss
+		case "EXPIRED":
+			class = ClassExpired
+		case "STALE":
+			class = ClassStale
+		case "UPDATING":
+			class = ClassUpdating
+		case "REVALIDATED":
+			class = ClassRevalidated
+		case "BYPASS", "DYNAMIC", "PASS", "NONE":
+			class = ClassUncacheable
+		default:
+			if strings.HasPrefix(token, "TCP_") {
+				if strings.HasSuffix(token, "_HIT") {
+					class = ClassHit
+				}
+				if strings.HasSuffix(token, "_MISS") {
+					class = ClassMiss
+				}
+			}
+		}
 	}
+	return class
+}
+
+func (c Class) needsRecheck() bool {
+	return c == ClassMiss || c == ClassExpired || c == ClassStale || c == ClassUpdating || c == ClassRevalidated
 }
 
 // ---------------------------------------------------------------------------
@@ -1369,24 +1470,29 @@ func (pc *PreCache) run(ctx context.Context, pages []Page) []Result {
 // ---------------------------------------------------------------------------
 
 type Stats struct {
-	Total        int
-	Hit          int
-	Miss         int
-	Uncacheable  int
-	NoHeader     int
-	NotFound     int
-	HTTPError    int
-	Exception    int
-	Unclassified int
-	Skipped      int
-	Retried      int
-	ServerErrors int // 5xx、429 和网络异常；用于源站不可用率
-	StatusCodes  map[int]int
-	Failures     []Result
+	Total         int
+	Hit           int
+	Miss          int
+	Expired       int
+	Stale         int
+	Updating      int
+	Revalidated   int
+	Uncacheable   int
+	NoHeader      int
+	NotFound      int
+	HTTPError     int
+	Exception     int
+	Unclassified  int
+	Skipped       int
+	Retried       int
+	ServerErrors  int // 5xx、429 和网络异常；用于源站不可用率
+	StatusCodes   map[int]int
+	CacheStatuses map[string]int
+	Failures      []Result
 }
 
 func summarize(results []Result) Stats {
-	s := Stats{StatusCodes: map[int]int{}}
+	s := Stats{StatusCodes: map[int]int{}, CacheStatuses: map[string]int{}}
 	s.Total = len(results)
 	for _, r := range results {
 		switch r.Class {
@@ -1394,6 +1500,14 @@ func summarize(results []Result) Stats {
 			s.Hit++
 		case ClassMiss:
 			s.Miss++
+		case ClassExpired:
+			s.Expired++
+		case ClassStale:
+			s.Stale++
+		case ClassUpdating:
+			s.Updating++
+		case ClassRevalidated:
+			s.Revalidated++
 		case ClassUncacheable:
 			s.Uncacheable++
 		case ClassNoHeader:
@@ -1412,6 +1526,9 @@ func summarize(results []Result) Stats {
 		if r.Status > 0 {
 			s.StatusCodes[r.Status]++
 		}
+		if r.CacheRaw != "" {
+			s.CacheStatuses[r.CacheRaw]++
+		}
 		if r.Attempts > 1 {
 			s.Retried++
 		}
@@ -1425,13 +1542,26 @@ func summarize(results []Result) Stats {
 	return s
 }
 
-// hitRate 只统计"可缓存"的分母，避免把 404 / 不可缓存页面算进来稀释命中率。
+func (s Stats) recheckCount() int {
+	return s.Miss + s.Expired + s.Stale + s.Updating + s.Revalidated
+}
+
+// hitRate 表示本轮直接 HIT 比例；STALE / REVALIDATED 等单独计数，不等同于 MISS。
 func (s Stats) hitRate() (float64, int) {
-	cacheable := s.Hit + s.Miss
+	cacheable := s.Hit + s.recheckCount()
 	if cacheable == 0 {
 		return 0, 0
 	}
 	return float64(s.Hit) / float64(cacheable) * 100, cacheable
+}
+
+func (s Stats) counts() map[string]int {
+	return map[string]int{
+		"hit": s.Hit, "miss": s.Miss, "expired": s.Expired, "stale": s.Stale,
+		"updating": s.Updating, "revalidated": s.Revalidated, "uncacheable": s.Uncacheable,
+		"no_header": s.NoHeader, "not_found": s.NotFound, "http_error": s.HTTPError,
+		"exception": s.Exception, "unclassified": s.Unclassified, "skipped": s.Skipped, "retried": s.Retried,
+	}
 }
 
 // blocked 统计典型的"被拦截"状态码：403 拒绝、429 限流、503 挑战/过载
@@ -1452,7 +1582,7 @@ func (s Stats) errRate() float64 {
 	return float64(s.ServerErrors) / float64(completed) * 100
 }
 
-func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string) {
+func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string, includeRate bool) {
 	hitRate, cacheable := s.hitRate()
 
 	pc.out.Info("---------------------------------------------------------")
@@ -1462,24 +1592,49 @@ func (pc *PreCache) printStats(s Stats, elapsed time.Duration, title string) {
 	}
 
 	if pc.cfg.CacheHeader != "" {
-		if s.Hit > 0 {
-			pc.out.Ok("  已缓存 (HIT)      ：%d", s.Hit)
-		}
-		if s.Miss > 0 {
-			pc.out.Hint("  可预缓存 (MISS)   ：%d", s.Miss)
+		pc.out.Ok("  直接命中 (HIT)       ：%d", s.Hit)
+		for _, row := range []struct {
+			label string
+			count int
+		}{
+			{"未命中 (MISS)", s.Miss}, {"已过期 (EXPIRED)", s.Expired},
+			{"旧缓存响应 (STALE)", s.Stale}, {"更新中 (UPDATING)", s.Updating},
+			{"验证有效 (REVALIDATED)", s.Revalidated},
+		} {
+			if row.count > 0 {
+				pc.out.Info("  %s：%d", row.label, row.count)
+			}
 		}
 		if s.Uncacheable > 0 {
 			pc.out.Err("  不可缓存          ：%d", s.Uncacheable)
 			// 典型误用：用 HEAD 预热，而 CDN 只对 GET 建立缓存，结果全是 BYPASS
-			if pc.cfg.UseHead && s.Hit == 0 && s.Miss == 0 {
+			if pc.cfg.UseHead && s.Hit == 0 && s.recheckCount() == 0 {
 				pc.out.Warn("  提示：全部页面都不可缓存，很可能是 -head 导致的（多数 CDN 只对 GET 建立缓存），去掉 -head 再试")
 			}
 		}
 		if s.NoHeader > 0 {
 			pc.out.Warn("  缺少缓存标识头    ：%d", s.NoHeader)
 		}
-		if cacheable > 0 {
-			pc.out.Ok("  缓存命中率：%.1f%% (%d/%d)", hitRate, s.Hit, cacheable)
+		if cacheable > 0 && includeRate {
+			pc.out.Ok("  %s直接命中率（仅 HIT）：%.1f%% (%d/%d)", title, hitRate, s.Hit, cacheable)
+		}
+		if s.Stale+s.Updating > 0 {
+			pc.out.Info("  STALE / UPDATING 表示返回旧缓存，可能正在后台更新，不等同于 MISS")
+		}
+		if s.Revalidated > 0 {
+			pc.out.Info("  REVALIDATED 表示缓存经源站验证仍有效，不等同于 MISS")
+		}
+		if len(s.CacheStatuses) > 0 {
+			var keys []string
+			for key := range s.CacheStatuses {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			var parts []string
+			for _, key := range keys {
+				parts = append(parts, fmt.Sprintf("%q×%d", key, s.CacheStatuses[key]))
+			}
+			pc.out.Info("  原始缓存头分布（%s）：%s", pc.cfg.CacheHeader, strings.Join(parts, "  "))
 		}
 	} else {
 		pc.out.Warn("未指定 -cacheheader，跳过缓存状态统计")
@@ -1603,21 +1758,26 @@ type jsonSlow struct {
 }
 
 type jsonRecheck struct {
-	WaitSeconds  float64       `json:"wait_seconds"`
-	Hit          int           `json:"hit"`
-	Miss         int           `json:"miss"`
-	NotHit       int           `json:"not_hit"`
-	HitRate      float64       `json:"hit_rate"`
-	Total        int           `json:"total"`
-	HTTPError    int           `json:"http_error"`
-	Exception    int           `json:"exception"`
-	Skipped      int           `json:"skipped"`
-	NotFound     int           `json:"not_found"`
-	Uncacheable  int           `json:"uncacheable"`
-	NoHeader     int           `json:"no_header"`
-	Unclassified int           `json:"unclassified"`
-	ErrorRate    float64       `json:"error_rate"`
-	Failures     []jsonFailure `json:"failures,omitempty"`
+	WaitSeconds   float64        `json:"wait_seconds"`
+	Hit           int            `json:"hit"`
+	Miss          int            `json:"miss"`
+	Expired       int            `json:"expired"`
+	Stale         int            `json:"stale"`
+	Updating      int            `json:"updating"`
+	Revalidated   int            `json:"revalidated"`
+	CacheStatuses map[string]int `json:"cache_statuses"`
+	NotHit        int            `json:"not_hit"`
+	HitRate       float64        `json:"hit_rate"`
+	Total         int            `json:"total"`
+	HTTPError     int            `json:"http_error"`
+	Exception     int            `json:"exception"`
+	Skipped       int            `json:"skipped"`
+	NotFound      int            `json:"not_found"`
+	Uncacheable   int            `json:"uncacheable"`
+	NoHeader      int            `json:"no_header"`
+	Unclassified  int            `json:"unclassified"`
+	ErrorRate     float64        `json:"error_rate"`
+	Failures      []jsonFailure  `json:"failures,omitempty"`
 }
 
 type jsonReport struct {
@@ -1631,6 +1791,8 @@ type jsonReport struct {
 	Counts           map[string]int `json:"counts"`
 	StatusCodes      map[string]int `json:"status_codes"`
 	HitRate          float64        `json:"hit_rate"`
+	FirstPassHitRate float64        `json:"first_pass_hit_rate"`
+	CacheStatuses    map[string]int `json:"cache_statuses"`
 	ErrorRate        float64        `json:"error_rate"`
 	AvgRPS           float64        `json:"avg_rps"`
 	Failures         []jsonFailure  `json:"failures,omitempty"`
@@ -1646,22 +1808,18 @@ type jsonReport struct {
 func (pc *PreCache) writeJSON(path string, results []Result, s Stats, elapsed time.Duration, rc *jsonRecheck, exitCode int) error {
 	hitRate, _ := s.hitRate()
 	rep := jsonReport{
-		Version:     version,
-		StartTime:   pc.startTime.Format(time.RFC3339),
-		EndTime:     time.Now().Format(time.RFC3339),
-		DurationSec: elapsed.Seconds(),
-		Sitemap:     pc.cfg.Sitemap,
-		Host:        pc.cfg.Host,
-		Total:       s.Total,
-		Counts: map[string]int{
-			"hit": s.Hit, "miss": s.Miss, "uncacheable": s.Uncacheable,
-			"no_header": s.NoHeader, "not_found": s.NotFound,
-			"http_error": s.HTTPError, "exception": s.Exception,
-			"unclassified": s.Unclassified,
-			"skipped":      s.Skipped, "retried": s.Retried,
-		},
+		Version:          version,
+		StartTime:        pc.startTime.Format(time.RFC3339),
+		EndTime:          time.Now().Format(time.RFC3339),
+		DurationSec:      elapsed.Seconds(),
+		Sitemap:          pc.cfg.Sitemap,
+		Host:             pc.cfg.Host,
+		Total:            s.Total,
+		Counts:           s.counts(),
 		StatusCodes:      map[string]int{},
 		HitRate:          hitRate,
+		FirstPassHitRate: hitRate,
+		CacheStatuses:    s.CacheStatuses,
 		ErrorRate:        s.errRate(),
 		Recheck:          rc,
 		Completed:        s.Total - s.Skipped,
@@ -1848,56 +2006,62 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 		pc.out.Warn("收到中断信号，已提前结束，以下为部分结果")
 	}
 
-	pc.printStats(stats, elapsed, "预缓存完成")
+	pc.printStats(stats, elapsed, "首轮请求", true)
 	pc.printStatusCodes(stats)
 	pc.printFailures(stats)
 	pc.printSlowest(results)
 
 	// 预热后复检：自动验证缓存是否真的生效
 	var rc *jsonRecheck
-	if pc.cfg.Recheck > 0 && stats.Miss > 0 && ctx.Err() == nil && !pc.aborted() {
+	if pc.cfg.Recheck > 0 && stats.recheckCount() > 0 && ctx.Err() == nil && !pc.aborted() {
 		pc.out.Info("---------------------------------------------------------")
 		pc.out.Hint("等待 %v 后进行缓存复检...", pc.cfg.Recheck)
 		sleep(ctx, pc.cfg.Recheck)
 
-		var missPages []Page
+		var recheckPages []Page
 		for _, r := range results {
-			if r.Class == ClassMiss {
-				missPages = append(missPages, r.Page)
+			if r.Class.needsRecheck() {
+				recheckPages = append(recheckPages, r.Page)
 			}
 		}
-		if len(missPages) == 0 {
-			pc.out.Ok("复检：没有需要复检的页面（首轮无 MISS）")
-		} else {
-			reResults := pc.run(ctx, missPages)
-			reStats := summarize(reResults)
-			rate := float64(reStats.Hit) / float64(len(missPages)) * 100
-			pc.out.Ok("复检结果：%d 个页面中 %d 个已命中（%.1f%%）", len(missPages), reStats.Hit, rate)
-			if reStats.Hit < len(missPages) {
-				pc.out.Warn("仍有 %d 个页面未确认命中（含请求错误和未执行），请结合复检明细检查缓存规则或源站响应",
-					len(missPages)-reStats.Hit)
-			}
-			rc = &jsonRecheck{
-				WaitSeconds:  pc.cfg.Recheck.Seconds(),
-				Hit:          reStats.Hit,
-				Miss:         reStats.Miss,
-				NotHit:       len(missPages) - reStats.Hit,
-				HitRate:      rate,
-				Total:        len(missPages),
-				HTTPError:    reStats.HTTPError,
-				Exception:    reStats.Exception,
-				Skipped:      reStats.Skipped,
-				NotFound:     reStats.NotFound,
-				Uncacheable:  reStats.Uncacheable,
-				NoHeader:     reStats.NoHeader,
-				Unclassified: reStats.Unclassified,
-				ErrorRate:    reStats.errRate(),
-			}
-			for _, f := range reStats.Failures {
-				rc.Failures = append(rc.Failures, jsonFailure{URL: f.Page.RawURL, Class: f.Class.String(), Status: f.Status, Error: f.Err, Attempts: f.Attempts})
-			}
-			pc.printFailures(reStats)
+		reStart := time.Now()
+		reResults := pc.run(ctx, recheckPages)
+		reStats := summarize(reResults)
+		pc.printStats(reStats, time.Since(reStart), "复检请求", false)
+		pc.printStatusCodes(reStats)
+		rate := float64(reStats.Hit) / float64(len(recheckPages)) * 100
+		pc.out.Ok("预热后复检命中率（仅首轮待确认页面）：%.1f%% (%d/%d)", rate, reStats.Hit, len(recheckPages))
+		if reStats.Hit < len(recheckPages) {
+			pc.out.Warn("仍有 %d 个页面未确认命中（含请求错误和未执行），请结合复检明细检查缓存规则或源站响应",
+				len(recheckPages)-reStats.Hit)
 		}
+		rc = &jsonRecheck{
+			WaitSeconds:   pc.cfg.Recheck.Seconds(),
+			Hit:           reStats.Hit,
+			Miss:          reStats.Miss,
+			Expired:       reStats.Expired,
+			Stale:         reStats.Stale,
+			Updating:      reStats.Updating,
+			Revalidated:   reStats.Revalidated,
+			CacheStatuses: reStats.CacheStatuses,
+			NotHit:        len(recheckPages) - reStats.Hit,
+			HitRate:       rate,
+			Total:         len(recheckPages),
+			HTTPError:     reStats.HTTPError,
+			Exception:     reStats.Exception,
+			Skipped:       reStats.Skipped,
+			NotFound:      reStats.NotFound,
+			Uncacheable:   reStats.Uncacheable,
+			NoHeader:      reStats.NoHeader,
+			Unclassified:  reStats.Unclassified,
+			ErrorRate:     reStats.errRate(),
+		}
+		for _, f := range reStats.Failures {
+			rc.Failures = append(rc.Failures, jsonFailure{URL: f.Page.RawURL, Class: f.Class.String(), Status: f.Status, Error: f.Err, Attempts: f.Attempts})
+		}
+		pc.printFailures(reStats)
+	} else if pc.cfg.Recheck == 0 && stats.recheckCount() > 0 {
+		pc.out.Info("未启用预热后复检：以上仅为首轮响应状态，不能据此确认缓存已写入或更新；使用 -recheck=5s 验证")
 	}
 
 	// 更新每日观察记录，连续多天超时的 URL 才记入 slow-pages.txt。
@@ -1926,35 +2090,37 @@ func (pc *PreCache) Start(ctx context.Context) (int, error) {
 
 func main() {
 	var (
-		sitemap       = flag.String("sitemap", "", "网站地图地址 (必需)")
-		size          = flag.Int("size", 1, "并发数量，默认 1；动态站优先保持单并发")
-		timeout       = flag.Int("timeout", 10, "单请求超时（秒），默认 10")
-		delay         = flag.Int("delay", 1000, "请求完成后全局最小休息（毫秒），默认 1000；与非 HIT 按耗时休息取较大值")
-		rate          = flag.Float64("rate", 1, "全局 QPS 上限，默认 1；0 表示完全不限制（不建议，容易压垮源站）")
-		retries       = flag.Int("retry", 1, "失败重试次数（429/408/502/503/504 及网络错误），默认 1；超时不重试")
-		maxFail       = flag.Int("max-fail", 3, "连续多少个请求失败后熔断中止，默认 3；0 关闭熔断")
-		slowRatio     = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
-		maxLatency    = flag.Duration("max-latency", 3*time.Second, "慢响应保护阈值，默认 3s；0 关闭慢响应与首次超时保护")
-		cooldown      = flag.Duration("cooldown", 10*time.Second, "每次慢响应后的全局冷却，默认 10s")
-		maxSlow       = flag.Int("max-slow", 3, "连续慢响应中止阈值，默认 3；0 不按次数中止；超时仍立即中止")
-		restRatio     = flag.Float64("rest-ratio", 1, "非 HIT 请求结束后的全局休息/耗时倍数，默认 1；0 关闭按耗时休息")
-		slowThreshold = flag.Duration("slow-threshold", 2*time.Second, "慢页面榜单的耗时阈值，默认 2s；与超时排除无关")
-		limit         = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
-		exclude       = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
-		noLearn       = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：连续 3 天超时才记入 slow-pages.txt 并在下次运行时排除）")
-		learnFile     = flag.String("learn-file", "", "毒页面学习文件路径，默认 <程序目录>/slow-pages.txt")
-		host          = flag.String("host", "", "指定真实主机，例如 127.0.0.1:8080（会同时改写 Host 头）")
-		cacheHeader   = flag.String("cacheheader", "", "缓存标识头，例如 x-cache / cf-cache-status")
-		userAgent     = flag.String("useragent", "", "指定 UA，默认模拟 Chrome 浏览器")
-		verify        = flag.Bool("verify", false, "是否校验 SSL 证书，默认 false（不校验）")
-		head          = flag.Bool("head", false, "使用 HEAD 请求预热（省流量，但部分 CDN 只缓存 GET）")
-		recheck       = flag.Duration("recheck", 0, "预热后等待该时长再复检，例如 30s / 2m；0 表示不复检")
-		lastMod       = flag.Duration("lastmod", 0, "只预热 sitemap 中最近该时长内变更的页面，例如 24h；0 表示全部")
-		jsonPath      = flag.String("json", "", "将结果写入 JSON 文件，便于接入监控")
-		logPath       = flag.String("log", "", "日志文件路径，默认 <程序目录>/pre-cache.log；传 none 关闭文件日志")
-		maxErrRate    = flag.Float64("max-error-rate", 0, "错误率超过该百分比时以退出码 3 结束，0 表示不检查")
-		showVersion   = flag.Bool("version", false, "显示版本号后退出")
-		debug         = flag.Bool("debug", false, "输出调试信息")
+		sitemap          = flag.String("sitemap", "", "网站地图地址 (必需)")
+		size             = flag.Int("size", 1, "并发数量，默认 1；动态站优先保持单并发")
+		timeout          = flag.Int("timeout", 10, "单请求超时（秒），默认 10")
+		delay            = flag.Int("delay", 1000, "请求完成后全局最小休息（毫秒），默认 1000；与非 HIT 按耗时休息取较大值")
+		rate             = flag.Float64("rate", 1, "全局 QPS 上限，默认 1；0 表示完全不限制（不建议，容易压垮源站）")
+		retries          = flag.Int("retry", 1, "失败重试次数（429/408/502/503/504 及网络错误），默认 1；超时不重试")
+		maxFail          = flag.Int("max-fail", 3, "连续多少个请求失败后熔断中止，默认 3；0 关闭熔断")
+		slowRatio        = flag.Float64("slow-ratio", 3.0, "平均耗时超过基线的多少倍就自动降并发，默认 3；0 关闭自适应")
+		maxLatency       = flag.Duration("max-latency", 3*time.Second, "慢响应保护阈值，默认 3s；0 关闭慢响应与首次超时保护")
+		cooldown         = flag.Duration("cooldown", 10*time.Second, "每次慢响应后的全局冷却，默认 10s")
+		maxSlow          = flag.Int("max-slow", 3, "连续慢响应中止阈值，默认 3；0 不按次数中止；超时仍立即中止")
+		restRatio        = flag.Float64("rest-ratio", 1, "非 HIT 请求结束后的全局休息/耗时倍数，默认 1；0 关闭按耗时休息")
+		slowThreshold    = flag.Duration("slow-threshold", 2*time.Second, "慢页面榜单的耗时阈值，默认 2s；与超时排除无关")
+		limit            = flag.Int("limit", 0, "只处理 sitemap 中的前 N 个页面，用于灰度试跑；0 表示全部")
+		exclude          = flag.String("exclude", "", "排除 URL 包含这些子串的页面，逗号分隔，例如 -exclude=/user,/tags")
+		noLearn          = flag.Bool("no-learn", false, "关闭毒页面自动学习（默认开启：连续 3 天超时才记入 slow-pages.txt 并在下次运行时排除）")
+		learnFile        = flag.String("learn-file", "", "毒页面学习文件路径，默认 <程序目录>/slow-pages.txt")
+		host             = flag.String("host", "", "指定真实主机，例如 127.0.0.1:8080（会同时改写 Host 头）")
+		cacheHeader      = flag.String("cacheheader", "", "缓存标识头，例如 x-cache / cf-cache-status")
+		userAgent        = flag.String("useragent", "", "指定 UA，默认模拟 Chrome 浏览器")
+		verify           = flag.Bool("verify", false, "是否校验 SSL 证书，默认 false（不校验）")
+		head             = flag.Bool("head", false, "使用 HEAD 请求预热（省流量，但部分 CDN 只缓存 GET）")
+		recheck          = flag.Duration("recheck", 0, "预热后等待该时长再复检，例如 30s / 2m；0 表示不复检")
+		lastMod          = flag.Duration("lastmod", 0, "只预热 sitemap 中最近该时长内变更的页面，例如 24h；0 表示全部")
+		jsonPath         = flag.String("json", "", "将结果写入 JSON 文件，便于接入监控")
+		logPath          = flag.String("log", "", "日志文件路径，默认 <程序目录>/pre-cache.log；传 none 关闭文件日志")
+		logMaxBytes      = flag.Int64("log-max-bytes", 5242880, "程序日志轮转大小（字节），默认 5MiB；每天或达到此大小轮转，最多保留 1 份备份")
+		logRetentionDays = flag.Int("log-retention-days", 7, "日志文件保留天数，默认 7；启动和写入时清理过期文件")
+		maxErrRate       = flag.Float64("max-error-rate", 0, "错误率超过该百分比时以退出码 3 结束，0 表示不检查")
+		showVersion      = flag.Bool("version", false, "显示版本号后退出")
+		debug            = flag.Bool("debug", false, "输出调试信息")
 	)
 	flag.Parse()
 
@@ -1979,7 +2145,11 @@ func main() {
 		logTarget = ""
 	}
 
-	out := newPrinter(logTarget)
+	if *logMaxBytes <= 0 || *logRetentionDays < 1 || *logRetentionDays > 36500 {
+		fmt.Fprintln(os.Stderr, "错误：-log-max-bytes 必须大于 0，-log-retention-days 必须在 1 到 36500 之间")
+		os.Exit(1)
+	}
+	out := newPrinter(logTarget, *logMaxBytes, *logRetentionDays)
 	defer out.Close()
 
 	var excl []string

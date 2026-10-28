@@ -27,6 +27,7 @@
 - **sitemap 索引**：支持 `<sitemapindex>` 递归展开（最多 3 层）与 `.gz` 压缩包
 - **优雅中断**：Ctrl+C / SIGTERM 会停止派发并输出已完成部分的结果
 - **可观测**：状态码分布、失败明细、命中率、吞吐、退出码语义
+- **日志轮转**：程序日志每天或达到默认 5MiB 时轮转，当前日志之外最多保留 1 份 `.1` 备份，默认清理 7 天前的日志文件
 
 ## 实现原理
 
@@ -47,15 +48,19 @@
 
 | 分类 | 判定条件 |
 |------|----------|
-| 已缓存 HIT | 缓存头值包含 `HIT` |
-| 可预缓存 MISS | 包含 `MISS` / `EXPIRED` / `REVALIDATED` / `STALE` / `UPDATING` |
+| 直接命中 HIT | `HIT` / `TCP_HIT` / `TCP_MEM_HIT` 等 |
+| 未命中 MISS | `MISS` / `TCP_MISS` 等 |
+| 已过期 EXPIRED | 缓存过期，本次回源 |
+| 旧缓存响应 STALE | 返回过期缓存，可能触发后台更新或回源失败后使用旧缓存 |
+| 更新中 UPDATING | 更新过程中返回旧缓存 |
+| 验证有效 REVALIDATED | 缓存经源站验证仍有效 |
 | 不可缓存 | `BYPASS` / `DYNAMIC` / `PASS` / `NONE` 等 |
 | 缺少缓存头 | 响应中没有该头 |
 | 404 | 状态码 404 / 410，**单独统计，不计入"可预缓存"** |
 | HTTP 错误 | 其他 4xx / 5xx |
 | 请求异常 | 网络错误 / 超时（重试后仍失败） |
 
-命中率分母只包含 HIT + MISS，避免被 404 和不可缓存页面稀释。
+首轮直接命中率 = HIT / (HIT + MISS + EXPIRED + STALE + UPDATING + REVALIDATED)。后五种状态分别统计，不再统称 MISS；404、不可缓存和请求异常不进入首轮命中率分母。多层缓存头按最后一个可识别状态分类，完整原始头值另行展示，不把任意包含 `HIT` 字符的值直接当作命中。
 
 ## 编译
 
@@ -77,7 +82,7 @@ GOOS=linux GOARCH=arm64 go build -o pre-caching-arm64 main.go
 
 ```bash
 ./release.sh
-# 版本: 2.7.0
+# 版本: 2.7.1
 #   dist/pre-caching-amd64   6.3M
 #   dist/pre-caching-arm64   5.8M
 ```
@@ -114,7 +119,7 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 
 > **二进制和脚本必须一起更新**，否则会出现"脚本传了新参数、二进制不认识"的情况：
 > `flag provided but not defined: -retry`。
-> `run_precache.sh` 会做版本自检，二进制低于 v2.7.0 时直接给出明确提示，不会等到传入新参数后才失败。
+> `run_precache.sh` 会做版本自检，二进制低于 v2.7.1 时直接给出明确提示，不会等到传入新参数后才失败。升级需同时替换二进制和脚本。
 
 ## 使用示例
 
@@ -180,6 +185,8 @@ scp dist/pre-caching-amd64 run_precache.sh user@server:/opt/pre-caching/
 | `-lastmod` | 0 | 只预热最近该时长内变更的页面，如 `24h`；0 全部 |
 | `-json` | 空 | JSON 报告输出路径 |
 | `-log` | 程序目录/pre-cache.log | 日志路径；传 `none` 关闭文件日志 |
+| `-log-max-bytes` | 5242880 | 程序日志每天或达到此大小（字节，默认 5MiB）时轮转；当前文件外最多保留 1 份 `.1` 备份 |
+| `-log-retention-days` | 7 | 日志文件保留天数（1–36500）；启动和写入时清理过期备份，当前文件过期则清空后重新记录 |
 | `-max-error-rate` | 0 | 首轮或复检的服务不可用率(%)超过该值时以退出码 3 结束；0 不检查 |
 | `-version` | - | 显示版本号后退出 |
 | `-debug` | false | 调试输出 |
@@ -301,12 +308,15 @@ Accept-Encoding: gzip（由 Go 自动添加并透明解压）
 ## 输出结果说明
 
 - **页面总数**：从 sitemap 提取并去重后的数量
-- **已缓存 (HIT)**：缓存已命中的页面
-- **可预缓存 (MISS)**：本次访问触发了缓存生成的页面
+- **直接命中 (HIT)**：这一轮请求直接命中的页面；首轮 HIT 数不代表预热后的成功页数
+- **未命中 (MISS)**：这一轮缓存未命中；不能仅凭 HTTP 200 或 MISS 断定缓存已成功写入
+- **EXPIRED / STALE / UPDATING / REVALIDATED**：分别展示过期、旧缓存响应、更新中和验证有效，不再混入 MISS
+- **原始缓存头分布**：控制台和 JSON 的 `cache_statuses` 保留完整响应头值及数量，可核对实际缓存状态
 - **不可缓存**：CDN 规则决定不缓存的页面（需要改缓存规则，预热无效）
 - **缺少缓存标识头**：CDN 没有返回该头，通常说明 `-cacheheader` 配错了
 - **404 / HTTP 错误 / 请求异常**：失败明细会单独列出，便于清理死链
-- **复检结果**：只在首轮存在 MISS 时等待并复检，生效比例 = 复检 HIT 数 / 全部待复检页面数；HTTP 错误、网络异常和中断不会从分母中消失，失败详情写入 `recheck.failures`；`recheck.miss` 只统计真实 MISS，所有未命中项（含错误和中断）使用 `recheck.not_hit`
+- **复检结果**：开启 `-recheck` 后，对首轮 MISS / EXPIRED / STALE / UPDATING / REVALIDATED 页面再次请求，复检命中率 = 复检 HIT 数 / 全部待复检页面数；只代表这批页面在各自复检时的结果，不表示全站同一时刻的命中率。HTTP 错误、网络异常和中断不会从分母中消失；未启用复检会明确提示尚未验证预热效果
+- **JSON 统计**：`counts.miss` 和 `recheck.miss` 只统计 MISS，新增 `expired`、`stale`、`updating`、`revalidated`；原 `hit_rate` 保留且与 `first_pass_hit_rate` 相同，均为首轮直接命中率。`recheck.hit_rate` 使用全部待复检页面作分母，`recheck.not_hit` 包含所有非 HIT（含错误和中断），失败详情写入 `recheck.failures`。升级后监控若依赖旧版混合 MISS 数量，需改为汇总上述五种状态
 - **JSON 完整性**：报告使用临时文件加原子替换写入，避免读取到半份报告；指定报告但写入失败会非零退出。`exit_code` 记录任务状态，`requests` 包括健康检查、sitemap、重试、重定向与复检，`avg_rps` 按实际请求数及总耗时计算，`duration_sec` 包含复检等待
 - **增量筛选**：输出筛选前后的数量及缺少有效 `lastmod` 的页面数；未知修改时间的页面仍保留，避免漏预热，并明确提示增量可能退化为全量
 - **增量无变更**：有效 sitemap 经 `-lastmod` 过滤后无页面时正常退出 0，空 sitemap 仍视为错误
@@ -360,7 +370,17 @@ PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin
 - 仅支持 Linux，按 amd64 / arm64 自动选择可执行文件，并校验二进制版本
 - `SITEMAP_URL` 仍是占位地址时直接报错，避免预热到别人的站点
 - 防重叠执行锁（优先 `flock`，未安装时使用 mkdir + PID），中断时转发信号并等待子进程退出
-- 输出重定向到 `$SCRIPT_DIR/cron.log` 时自动轮转（超 5MB）
+- 输出重定向到 `CRON_LOG`（默认 `$SCRIPT_DIR/cron.log`）时，每次启动检查：跨天或达到默认 5MiB 即轮转，最多保留 `.1` 一份备份；超过默认 7 天未修改的备份删除，过期当前文件清空。保留当前 inode，兼容 cron 预先打开的追加描述符
+
+程序日志与 cron 日志共用配置：
+
+```bash
+# precache.env；不配置也会使用以下默认值
+LOG_MAX_BYTES=5242880
+LOG_RETENTION_DAYS=7
+```
+
+程序日志在启动和每次写入时检查；cron 日志在每次脚本运行时检查，并非后台清理服务。7 天按文件最后修改时间计算；每日轮转防止正常追加把很早的日志一直留在当前文件。最多一份备份是数量上限，不保证完整保存最近 7 天；大小轮转可能更早覆盖历史，单条超大日志也可能超过大小阈值。
 
 ## 注意事项
 
