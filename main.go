@@ -1790,7 +1790,6 @@ func (pc *PreCache) debugf(format string, args ...any) {
 }
 
 func (pc *PreCache) printOverview() {
-	pc.out.Info("")
 	pc.out.row(ansiCyan, "开始执行时间", "%s", pc.startTime.Format("2006-01-02 15:04:05"))
 	pc.out.row("", "站点地图", "%s", pc.cfg.Sitemap)
 	method := "GET"
